@@ -1,0 +1,2670 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8" />
+<!-- REM: Ohjelman tekijä / Author: Johannes Ketola -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<!-- REM: Darts-kimppaturnauksen parittaja - tekijä: Johannes Ketola -->
+<title>Triplacup</title>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<!-- REM: Tyylimäärittelyt - ohjelman tekijä: Johannes Ketola -->
+<style>
+  /* REM: Ohjelman tekijä: Johannes Ketola */
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<!-- REM: Sovelluksen juurielementti (React renderöi tähän) - tekijä: Johannes Ketola -->
+<!-- REM: Ohjelman tekijä / Author: Johannes Ketola -->
+<div id="root"></div>
+
+<!-- REM: Ohjelman koodi alkaa tästä - tekijä: Johannes Ketola -->
+<script type="text/babel">
+// REM: ==================================================================
+// REM: Darts-kimppaturnauksen parittaja
+// REM: Ohjelman tekijä / Author: Johannes Ketola
+// REM: (c) Johannes Ketola - kaikki oikeudet pidätetään
+// REM: ==================================================================
+const { useState, useMemo, useEffect, useRef } = React;
+
+// REM: Taulujen määrä - ohjelman tekijä: Johannes Ketola
+const BOARD_COUNT = 7;
+
+// REM: Triplacupin ja tablettien yhteys - ohjelman tekijä: Johannes Ketola
+// Kaksi yhteystapaa, sama rajapinta:
+//  - pilvi: Firebase Realtime Database (REST + live-virta). Kaikki laitteet tarvitsevat vain internetin.
+//    Tiedot ovat polussa /t/<turnauskoodi>/: k = kirjaus (assign, live, result), s = turnauksen varmuuskopio.
+//  - lahi:  triplacup-palvelin läppärillä (KAYNNISTA-TRIPLACUP.bat), laitteet samassa lähiverkossa.
+var TCLink = (function () {
+  var ABC = "abcdefghjkmnpqrstuvwxyz23456789";
+  function randCode(n) {
+    var s = "", i;
+    try { var a = new Uint32Array(n); crypto.getRandomValues(a); for (i = 0; i < n; i++) s += ABC[a[i] % ABC.length]; }
+    catch (e) { s = ""; for (i = 0; i < n; i++) s += ABC[Math.floor(Math.random() * ABC.length)]; }
+    return s;
+  }
+  function validCode(c) { return typeof c === "string" && /^[a-z0-9]{16,40}$/.test(c); }
+  function hash(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36) + "." + s.length;
+  }
+  // Taulujen numerot avaimiksi "b1", "b2"... (Firebase muuttaisi numeroavaimet taulukoksi)
+  function bk(m) {
+    var o = {};
+    if (m && typeof m === "object") Object.keys(m).forEach(function (k) { if (m[k] != null) o["b" + k] = m[k]; });
+    return o;
+  }
+  function unbk(m) {
+    var o = {};
+    if (m && typeof m === "object") Object.keys(m).forEach(function (k) { if (m[k] != null) o[/^b\d+$/.test(k) ? k.slice(1) : k] = m[k]; });
+    return o;
+  }
+  function viewOf(k) {
+    k = k || {};
+    var a = k.assign && typeof k.assign === "object" ? k.assign : null;
+    return {
+      assign: a ? { cfg: a.cfg || {}, v: a.v || "", boards: unbk(a.boards) } : null,
+      live: unbk(k.live),
+      result: unbk(k.result)
+    };
+  }
+  // Live-virran muutokset paikalliseen kopioon
+  function setAt(root, path, data, merge) {
+    if (merge) {
+      if (data && typeof data === "object") Object.keys(data).forEach(function (key) { root = setAt(root, path.replace(/\/+$/, "") + "/" + key, data[key], false); });
+      return root;
+    }
+    var parts = String(path || "/").split("/").filter(Boolean);
+    if (!parts.length) return data == null ? null : data;
+    root = root && typeof root === "object" ? root : {};
+    var o = root;
+    for (var i = 0; i < parts.length - 1; i++) {
+      if (!o[parts[i]] || typeof o[parts[i]] !== "object") o[parts[i]] = {};
+      o = o[parts[i]];
+    }
+    var last = parts[parts.length - 1];
+    if (data == null) delete o[last]; else o[last] = data;
+    return root;
+  }
+  // Kuuntelee polkua: ensisijaisesti live-virta (EventSource), varalla haku 1,5 s välein
+  function stream(url, onData, onConn) {
+    var alive = true, es = null, got = false, root = null, pt = null, polling = false, lastEv = Date.now();
+    function emit() { try { onData(root); } catch (e) { if (window.console) console.error(e); } }
+    function poll() {
+      if (!alive) return;
+      polling = true;
+      fetch(url + ".json", { cache: "no-store" })
+        .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+        .then(function (d) { if (!alive) return; root = d; onConn(true); emit(); })
+        .catch(function () { if (alive) onConn(false); })
+        .then(function () { if (alive) pt = setTimeout(poll, 1500); });
+    }
+    function toPoll() { if (polling || !alive) return; try { if (es) es.close(); } catch (e) {} es = null; poll(); }
+    function open() {
+      if (!alive || polling) return;
+      if (typeof EventSource === "undefined") { toPoll(); return; }
+      try {
+        got = false; lastEv = Date.now();
+        var my = new EventSource(url + ".json");
+        es = my;
+        my.addEventListener("put", function (e) { if (es !== my) return; var m = JSON.parse(e.data); root = setAt(root, m.path, m.data, false); got = true; lastEv = Date.now(); onConn(true); emit(); });
+        my.addEventListener("patch", function (e) { if (es !== my) return; var m = JSON.parse(e.data); root = setAt(root, m.path, m.data, true); got = true; lastEv = Date.now(); onConn(true); emit(); });
+        my.addEventListener("keep-alive", function () { lastEv = Date.now(); });
+        my.addEventListener("cancel", function () { onConn(false); toPoll(); });
+        my.onerror = function () {
+          if (!alive || es !== my) return;
+          onConn(false);
+          if (!got) { toPoll(); return; }                   // virta ei toimi tässä selaimessa/verkossa
+          if (my.readyState === 2) { es = null; setTimeout(open, 2000); } // suljettu: avataan uudelleen
+        };
+      } catch (e) { toPoll(); }
+    }
+    open();
+    // vahtikoira: ellei virrasta kuulu mitään 75 sekuntiin (myös keep-alive), yhteys avataan uudelleen
+    var wd = setInterval(function () {
+      if (!alive || polling) return;
+      if (!got && Date.now() - lastEv > 8000) { toPoll(); return; }
+      if (got && Date.now() - lastEv > 75000) { try { if (es) es.close(); } catch (e) {} es = null; onConn(false); open(); }
+    }, 4000);
+    return function () { alive = false; clearTimeout(pt); clearInterval(wd); try { if (es) es.close(); } catch (e) {} es = null; };
+  }
+  function jreq(url, method, body, headers) {
+    return fetch(url, { method: method, headers: headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(String(r.status)); return r.json(); });
+  }
+  function cloud(db, code) {
+    var base = String(db).replace(/\/+$/, "") + "/t/" + code;
+    function req(method, path, body) { return jreq(base + path + ".json", method, body); }
+    return {
+      mode: "pilvi", code: code,
+      watch: function (onState, onConn) { return stream(base + "/k", function (k) { onState(viewOf(k)); }, onConn); },
+      watchAll: function (onAll, onConn) {
+        return stream(base, function (r) {
+          r = r || {};
+          var saved = null;
+          try { saved = typeof r.s === "string" ? JSON.parse(r.s) : null; } catch (e) {}
+          onAll({ state: viewOf(r.k), saved: saved });
+        }, onConn);
+      },
+      assign: function (a) { return req("PUT", "/k/assign", { cfg: a.cfg, v: a.v, boards: bk(a.boards) }); },
+      live: function (b, L) { return req("PUT", "/k/live/b" + b, L); },
+      result: function (b, R) { return req("PUT", "/k/result/b" + b, R); },
+      ack: function (b) { var o = {}; o["live/b" + b] = null; o["result/b" + b] = null; return req("PATCH", "/k", o); },
+      save: function (obj) { return req("PUT", "/s", JSON.stringify(obj)); },
+      load: function () { return req("GET", "/s").then(function (s) { return typeof s === "string" ? JSON.parse(s) : null; }); }
+    };
+  }
+  function local() {
+    var H = { "Content-Type": "text/plain" };
+    return {
+      mode: "lahi",
+      watch: function (onState, onConn) {
+        var alive = true, t = null;
+        function tick() {
+          jreq("/api/state", "GET", undefined, H)
+            .then(function (s) {
+              if (!alive) return;
+              var a = s.assign && typeof s.assign === "object" && Object.keys(s.assign).length ? s.assign : null;
+              onConn(true);
+              onState({ assign: a ? { cfg: a.cfg || {}, v: a.v || "", boards: a.boards || {} } : null, live: s.live || {}, result: s.result || {} });
+            })
+            .catch(function () { if (alive) onConn(false); })
+            .then(function () { if (alive) t = setTimeout(tick, 1200); });
+        }
+        tick();
+        return function () { alive = false; clearTimeout(t); };
+      },
+      assign: function (a) { return jreq("/api/assign", "POST", a, H); },
+      live: function (b, L) { return jreq("/api/live/" + b, "POST", L, H); },
+      result: function (b, R) { return jreq("/api/result/" + b, "POST", R, H); },
+      ack: function (b) { return jreq("/api/ack/" + b, "POST", {}, H); },
+      save: function () { return Promise.resolve(null); },
+      load: function () { return Promise.reject(new Error("lahi")); }
+    };
+  }
+  return { cloud: cloud, local: local, hash: hash, randCode: randCode, validCode: validCode, setAt: setAt };
+})();
+
+// REM: Tablettikirjaus - ohjelman tekijä: Johannes Ketola
+// Jokaisen taulun tabletti tai puhelin näkee taululle käynnistetyn ottelun, kirjaa sen X01-kirjauksella ja
+// lähettää tilanteen livenä. Vahvistettu tulos päivittää kaavion itsestään.
+//  - Internet (oletus): kaikki laitteet tarvitsevat vain nettiyhteyden, verkon ei tarvitse olla sama.
+//  - Lähiverkko: triplacup-palvelin läppärillä (KAYNNISTA-TRIPLACUP.bat).
+const KIRJAUS_KEY = "triplacup-kirjaus-v1";
+const PILVI_KEY = "triplacup-pilvi-v1";
+const PILVI_DB = "https://triplacup-default-rtdb.europe-west1.firebasedatabase.app";
+const HTTP_ON = /^https?:$/.test(window.location.protocol);
+function pageDir() { return window.location.origin + window.location.pathname.replace(/[^/]*$/, ""); }
+function onLocalServer() { return HTTP_ON && window.location.port === "8765"; }
+// REM: Ottelusäännöt (pelimuoto, ottelun pituus kaavion osittain, tiebreak) - ohjelman tekijä: Johannes Ketola
+// Mallina ACRHI DARTSin Tuplacup: pituus asetetaan voittajien kaavion kierroksittain sekä hävinneiden
+// kaavioille, niiden finaaleille, välierälle ja finaalille. Säännöt kulkevat tableteille ottelukohtaisesti.
+const BO_MAX = 21;
+const BO_KEYS = ["w1", "w2", "w3", "w4", "w5", "w6", "l1", "l1f", "l2", "l2f", "sf", "f"];
+function boTxt(n, lc) { const d = n % 10, t = `Paras ${n}:${[2, 3, 6, 8].includes(d) ? "sta" : "stä"}`; return lc ? t.toLowerCase() : t; }
+function clampStart(v) { const n = Math.round(Number(v)); return n >= 101 && n <= 2000 ? n : 501; }
+function clampBo(v) { let n = Math.round(Number(v)) || 3; if (n % 2 === 0) n += 1; return Math.max(1, Math.min(BO_MAX, n)); }
+function clampTb(v) { let n = Math.round(Number(v)) || 30; n = Math.round(n / 3) * 3; return Math.max(9, Math.min(99, n)); }
+function defaultRules(b) {
+  const bo = {};
+  BO_KEYS.forEach((k) => (bo[k] = clampBo(b || 3)));
+  return { start: 501, tb: false, tbDarts: 30, preset: "", bo };
+}
+function normRules(o) {
+  const d = defaultRules(o && typeof o.bo === "number" ? o.bo : 3); // vanha muoto {start, bo: 3}
+  if (!o || typeof o !== "object") return d;
+  const bo = { ...d.bo };
+  if (o.bo && typeof o.bo === "object") BO_KEYS.forEach((k) => { if (o.bo[k] != null) bo[k] = clampBo(o.bo[k]); });
+  return { start: clampStart(o.start), tb: !!o.tb, tbDarts: clampTb(o.tbDarts), preset: typeof o.preset === "string" ? o.preset : "", bo };
+}
+function loadKirjaus() {
+  try { return normRules(JSON.parse(localStorage.getItem(KIRJAUS_KEY) || "null")); } catch (e) {}
+  return defaultRules(3);
+}
+function boKeyOf(m, totalRounds) {
+  if (!m) return "w1";
+  const tr = totalRounds || {};
+  if (m.sec === "WB") return "w" + Math.min(6, Math.max(1, m.roundIndex));
+  if (m.sec === "LB1") return m.roundIndex === tr.LB1 ? "l1f" : "l1";
+  if (m.sec === "LB2") return m.roundIndex === tr.LB2 ? "l2f" : "l2";
+  if (m.sec === "SF") return "sf";
+  return "f";
+}
+function boFor(rules, m, totalRounds) { return clampBo(rules && rules.bo ? rules.bo[boKeyOf(m, totalRounds)] : 3); }
+// Valmiit pituudet (kuten ACRHI:n LYHYT / NORMAALI / PITKÄ): pidemmät ottelut, kun pelaajia on jäljellä vähemmän
+function presetBo(name, size) {
+  const bo = {}, W = Math.round(Math.log2(size || 16));
+  for (let r = 1; r <= 6; r++) {
+    const x = (size || 16) / Math.pow(2, r - 1); // pelaajia kierroksella
+    bo["w" + r] = name === "short" ? 3 : name === "long" ? (x >= 8 ? 5 : 7) : (x >= 8 ? 3 : 5);
+    if (r > W) bo["w" + r] = bo["w" + W] || 3;
+  }
+  if (name === "short") Object.assign(bo, { l1: 3, l1f: 3, l2: 3, l2f: 3, sf: 3, f: 5 });
+  else if (name === "long") Object.assign(bo, { l1: 5, l1f: 7, l2: 5, l2f: 7, sf: 7, f: 9 });
+  else Object.assign(bo, { l1: 3, l1f: 5, l2: 3, l2f: 5, sf: 5, f: 7 });
+  return bo;
+}
+function rulesLine(rules) {
+  return `${rules.start} · tupla ulos${rules.tb ? ` · tiebreak ${rules.tbDarts} tikan jälkeen` : ""}`;
+}
+function loadPilvi() {
+  let o = null;
+  try { o = JSON.parse(localStorage.getItem(PILVI_KEY) || "null"); } catch (e) {}
+  o = o && typeof o === "object" ? o : {};
+  if (!TCLink.validCode(o.code)) o.code = TCLink.randCode(20);
+  if (o.mode !== "lahi" && o.mode !== "pilvi") o.mode = onLocalServer() ? "lahi" : "pilvi";
+  if (typeof o.sivut !== "string") o.sivut = "";
+  if (!o.sivut && HTTP_ON && !onLocalServer()) o.sivut = pageDir(); // avattu GitHub Pagesista
+  try { localStorage.setItem(PILVI_KEY, JSON.stringify(o)); } catch (e) {}
+  return o;
+}
+function pagesBase(pilvi) {
+  const s = (pilvi.sivut || "").trim();
+  if (!s) return "";
+  return /\/$/.test(s) ? s : s.replace(/\/(index\.html?)?$/i, "") + "/";
+}
+function makeLink(pilvi, srvInfo) {
+  if (pilvi.mode === "lahi") return srvInfo ? TCLink.local() : null;
+  return TCLink.cloud(PILVI_DB, pilvi.code);
+}
+// Turnauksen tila pilveen pienellä viiveellä (iso näyttö ja jatkaminen toisella laitteella)
+var CUR_LINK = null, __saveT = null;
+function pushSavedSoon() {
+  clearTimeout(__saveT);
+  __saveT = setTimeout(() => {
+    const l = CUR_LINK;
+    if (!l || l.mode !== "pilvi") return;
+    let session = null, roster = null;
+    try {
+      session = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || "null");
+      roster = JSON.parse(localStorage.getItem(ROSTER_STORAGE_KEY) || "null");
+    } catch (e) {}
+    l.save({ session, roster, at: Date.now() }).catch(() => {});
+  }, 700);
+}
+// Kirjauksen tila (taulujen ottelut, live-tilanteet ja tulokset)
+function useLinkState(link, active) {
+  const [st, setSt] = useState(null);
+  const [ok, setOk] = useState(false);
+  useEffect(() => {
+    setSt(null); setOk(false);
+    if (!link || !active) return undefined;
+    return link.watch(setSt, setOk);
+  }, [link, active]);
+  return [st, ok];
+}
+function copyText(t) {
+  try { if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t); } catch (e) {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta);
+  } catch (e) {}
+  return Promise.resolve();
+}
+function boardKeyOf(b) { return b.key || ("m" + b.matchId); }
+// Taulun livetilanne tabletilta (vain, jos se kuuluu taululla nyt olevaan otteluun)
+function liveForBoard(srvState, b) {
+  const L = srvState && srvState.live && srvState.live[String(b.id)];
+  return L && b.status === "playing" && L.key === boardKeyOf(b) ? L : null;
+}
+function TabletLive({ live, big }) {
+  if (!live) return <div className={`${big ? "text-sm" : "text-[11px]"} text-[#7a9484] italic`}>📱 odottaa aloitusta tabletilla</div>;
+  const legs = live.legs || [0, 0], rem = live.rem || ["", ""], T = live.tbS || null;
+  const cur = T ? T.turn : live.cur;
+  const tbv = (i) => (T && T.sc && T.sc[i] != null ? T.sc[i] : "–");
+  const row = (i) => (
+    <div className={`flex items-center justify-between gap-2 ${cur === i && !live.done ? "text-[#e7c977]" : ""}`}>
+      <span className={`${big ? "text-lg" : "text-xs"} truncate`}>{cur === i && !live.done ? "▶ " : ""}{(live.names || [])[i]}</span>
+      <span className="flex items-center gap-2 shrink-0">
+        <span className={`${big ? "text-sm" : "text-[10px]"} text-[#a9c2ae]`}>{legs[i] || 0} legiä</span>
+        <span className={`${big ? "text-4xl" : "text-lg"} font-bold tabular-nums`} style={{ fontFamily: "Georgia, serif" }}>{live.done ? (legs[i] || 0) : T ? tbv(i) : rem[i]}</span>
+      </span>
+    </div>
+  );
+  return (
+    <div className={`rounded border border-[#2c4a63] bg-[#0f1c2a] ${big ? "px-3 py-2" : "px-2 py-1.5"} mb-2`}>
+      <div className={`${big ? "text-xs" : "text-[10px]"} text-[#5b9bd5] mb-1`}>📱 {live.done ? "Ottelu päättynyt – odottaa vahvistusta" : `Legi ${live.leg || 1} · ${live.start} · ${boTxt(live.bo || 3, true)}`}
+        {!live.done && T && <span className="ml-1.5 px-1.5 rounded bg-[#c0392b] text-white font-semibold">⚔ TIEBREAK</span>}
+        {!live.done && !T && live.tbLeft != null && (live.tbLeft <= 1
+          ? <span className="ml-1.5 px-1.5 rounded bg-[#c0392b] text-white font-semibold">⚔ TIEBREAK TÄMÄN KIERROKSEN JÄLKEEN</span>
+          : <span className="ml-1.5 text-[#bfe3ff]">⚔ tiebreak {live.tbLeft} kierroksen päästä</span>)}
+      </div>
+      {row(0)}{row(1)}
+    </div>
+  );
+}
+
+// REM: Pelaajalista (nimi, taito, nopeus) - ohjelman tekijä: Johannes Ketola
+const NAMES = [
+  ["Aleksi Siivonen", "2", "2"],
+  ["Aleksi Suominen", "1", "1"],
+  ["Aleksi Virtanen", "3", "1"],
+  ["Daniel Lundström", "3", "2"],
+  ["Elmo Lindroos", "3", "2"],
+  ["Elmo Sirkiä", "3", "2"],
+  ["Heikki Saikkonen", "2", "3"],
+  ["Iiro Koivula", "2", "2"],
+  ["Jasu Rannikko", "3", "1"],
+  ["Joel Hallenberg", "2", "1"],
+  ["Johannes Ketola", "3", "2"],
+  ["Jouni Vahlsten", "1", "2"],
+  ["Kari Friman", "2", "3"],
+  ["Karim Svenskberg", "2", "2"],
+  ["Lenni Vallin", "2", "1"],
+  ["Leo Löytänä", "3", "2"],
+  ["Marko Tortinmäki", "2", "3"],
+  ["Mattias Bäck", "2", "1"],
+  ["Max Zetter", "2", "3"],
+  ["Mikko Sammal", "3", "2"],
+  ["Nico Kullberg", "3", "2"],
+  ["Niilo Lehtonen", "1", "1"],
+  ["Niko Levo", "3", "3"],
+  ["Oliver Rokala", "1", "1"],
+  ["Oskari Metsola", "2", "1"],
+  ["Otto Sjöström", "2", "2"],
+  ["Peter Ruohomäki", "3", "3"],
+  ["Petri Lindberg", "1", "2"],
+  ["Petri Tamminen", "3", "2"],
+  ["Pietari Haapalainen", "2", "2"],
+  ["Rasmus Rokala", "", ""],
+  ["Riia Tammelin", "3", "2"],
+  ["Riina Kahari", "3", "3"],
+  ["Robin Leisten", "3", "3"],
+  ["Roope Rantala", "3", "1"],
+  ["Sami Jalo", "2", "3"],
+  ["Samu Aalto", "1", "2"],
+  ["Severi Leinonen", "3", "2"],
+  ["Teemu Jolkkonen", "1", "1"],
+  ["Teemu Tuomi", "2", "2"],
+  ["Tero Löytänä", "2", "1"],
+  ["Toivo Kallio", "2", "1"],
+  ["Tommi Kujanpää", "2", "2"],
+  ["Venla Lehtovuori", "3", "3"],
+  ["Vertti Lehtovuori", "2", "2"],
+  ["Ville Parma", "1", "2"],
+  ["Viljo Kirstilä", "2", "1"],
+];
+
+// REM: Pelaajarekisterin tallennus - ohjelman tekijä: Johannes Ketola
+const ROSTER_STORAGE_KEY = "darts-parittaja-roster-v1";
+
+// REM: Pelaajarekisterin lajittelu - ohjelman tekijä: Johannes Ketola
+function rosterSort(a, b) {
+  const firstA = a.name.trim().split(/\s+/)[0];
+  const firstB = b.name.trim().split(/\s+/)[0];
+  return firstA.localeCompare(firstB, "fi-FI", { sensitivity: "base" }) ||
+    a.name.localeCompare(b.name, "fi-FI", { sensitivity: "base" });
+}
+
+function normalizeRosterName(name) {
+  return name.trim().toLocaleLowerCase("fi-FI");
+}
+
+function defaultBoardRestrictionsForName(name) {
+  return normalizeRosterName(name) === normalizeRosterName("Leo Löytänä") ? [5] : [];
+}
+
+function normalizeBoardRestrictions(value, name = "") {
+  const source = Array.isArray(value) ? value : defaultBoardRestrictionsForName(name);
+  return [...new Set(source.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= BOARD_COUNT))].sort((a, b) => a - b);
+}
+
+// REM: Rekisterin lataus ja tallennus (localStorage) - ohjelman tekijä: Johannes Ketola
+function loadSavedRoster() {
+  const builtIn = NAMES.map(([name, skill, speed]) => ({ name, skill, speed, boardRestrictions: defaultBoardRestrictionsForName(name) }));
+  try {
+    const raw = localStorage.getItem(ROSTER_STORAGE_KEY);
+    const saved = raw ? JSON.parse(raw) : [];
+    const merged = new Map(builtIn.map((p) => [normalizeRosterName(p.name), p]));
+    if (Array.isArray(saved)) {
+      saved.forEach((p) => {
+        if (!p || !p.name) return;
+        const playerName = String(p.name).trim();
+        merged.set(normalizeRosterName(playerName), {
+          name: playerName,
+          skill: p.skill == null ? "" : String(p.skill),
+          speed: p.speed == null ? "" : String(p.speed),
+          boardRestrictions: normalizeBoardRestrictions(p.boardRestrictions, playerName),
+        });
+      });
+    }
+    return [...merged.values()].sort(rosterSort);
+  } catch (e) {
+    return builtIn.sort(rosterSort);
+  }
+}
+
+function persistRoster(roster) {
+  try {
+    localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(roster));
+  } catch (e) {
+    // Storage can be unavailable in private/embedded browsing contexts.
+  }
+}
+
+// Full crash-recovery snapshot: everything needed to resume exactly where
+// you left off — setup progress OR an active tournament bracket — saved
+// after every state-changing action so a power loss or accidental tab
+// close never loses the tournament.
+const SESSION_STORAGE_KEY = "darts-parittaja-session-v1";
+
+// REM: Istunnon tallennus ja palautus (kaatumissuojaus) - ohjelman tekijä: Johannes Ketola
+function loadSavedSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function persistSession(snapshot) {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch (e) {
+    // Storage can be unavailable in private/embedded browsing contexts.
+  }
+  pushSavedSoon();
+}
+
+function clearSavedSession() {
+  try {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch (e) {
+    // ignore
+  }
+}
+
+// REM: ============================================================
+// REM: Triplacup-pelimuodon moottori (kaksinkertainen/putoava kaavio)
+// REM: Sovitettu triplacup.html-tiedostosta osaksi paritustyökalua
+// REM: ============================================================
+const TRIPLA_SECTION_LABELS = {
+  WB: { title: "Voittajien lohko", tag: "0 tappiota" },
+  LB1: { title: "Häviäjien lohko 1", tag: "1. tappion lohko" },
+  LB2: { title: "Häviäjien lohko 2", tag: "2. tappion lohko" },
+  SF: { title: "Välierä", tag: "lohko 1:n ja lohko 2:n mestarit vastakkain — tarvittaessa uusintaottelu" },
+  F: { title: "Finaali", tag: "yksi ottelu ratkaisee mestaruuden" },
+};
+
+// Short human labels + colors for showing which bracket a match belongs to
+// on a running board and in the "pick a match" dropdown. Pure/top-level so
+// both the control view and the read-only display view can use them.
+function triplaSectionShortLabel(m) {
+  if (!m) return "";
+  if (m.sec === "WB") return "Voittajien kaavio";
+  if (m.sec === "LB1") return "1. hävinneiden kaavio";
+  if (m.sec === "LB2") return "2. hävinneiden kaavio";
+  if (m.sec === "SF") return m.roundIndex === 2 ? "Uusintaottelu" : "Välierä";
+  if (m.sec === "F") return "Finaali";
+  return m.sec;
+}
+function triplaSectionBadgeClass(sec) {
+  return {
+    WB: "bg-[#1b3327] text-[#8fd19e]",
+    LB1: "bg-[#33240f] text-[#e0a35c]",
+    LB2: "bg-[#331414] text-[#e8a0a0]",
+    SF: "bg-[#2a2410] text-[#e7c977]",
+    F: "bg-[#2a2410] text-[#e7c977]",
+  }[sec] || "bg-[#1b3327] text-[#8fa396]";
+}
+
+function triplaSeed(i) { return { type: "seed", ref: i }; }
+function triplaWin(id) { return { type: "winner", ref: id }; }
+function triplaLos(id) { return { type: "loser", ref: id }; }
+
+// Builds a complete triple-elimination bracket definition for `size` players
+// (16 or 32). Structure ported directly from triplacup.html.
+function buildTriplaBracketDef(size) {
+  let nextId = 1;
+  const allMatches = [];
+  function newMatch(sec, roundIndex, p1, p2) {
+    const m = { id: nextId++, sec, roundIndex, p1, p2 };
+    allMatches.push(m);
+    return m;
+  }
+
+  const wbRoundsMatches = [];
+  let current = [];
+  for (let i = 0; i < size / 2; i++) {
+    current.push(newMatch("WB", 1, triplaSeed(2 * i), triplaSeed(2 * i + 1)));
+  }
+  wbRoundsMatches.push(current);
+  let wbRoundIdx = 1;
+  while (current.length > 1) {
+    wbRoundIdx++;
+    const next = [];
+    for (let i = 0; i < current.length / 2; i++) {
+      next.push(newMatch("WB", wbRoundIdx, triplaWin(current[2 * i].id), triplaWin(current[2 * i + 1].id)));
+    }
+    wbRoundsMatches.push(next);
+    current = next;
+  }
+  const wbChampionMatch = current[0];
+  const wbTotalRounds = wbRoundIdx;
+  const wbLoserWaves = wbRoundsMatches.map((roundArr) => roundArr.map((m) => m.id));
+
+  function buildLoserBracket(waveRoundsSourceIds, sec) {
+    let lbRoundIdx = 0;
+    const lbRoundsOut = [];
+    function loserSrcs(ids) { return ids.map((id) => ({ type: "loser", ref: id })); }
+    function winnerSrcs(matchObjs) { return matchObjs.map((m) => ({ type: "winner", ref: m.id })); }
+    function reduceRound(items) {
+      lbRoundIdx++;
+      const n = items.length, half = n / 2;
+      const roundMatches = [];
+      for (let i = 0; i < half; i++) roundMatches.push(newMatch(sec, lbRoundIdx, items[i], items[n - 1 - i]));
+      lbRoundsOut.push(roundMatches.map((m) => m.id));
+      return roundMatches;
+    }
+    function mergeRound(survivors, waveItems) {
+      lbRoundIdx++;
+      const n = survivors.length;
+      const roundMatches = [];
+      for (let i = 0; i < n; i++) roundMatches.push(newMatch(sec, lbRoundIdx, survivors[i], waveItems[n - 1 - i]));
+      lbRoundsOut.push(roundMatches.map((m) => m.id));
+      return roundMatches;
+    }
+    let survivors = winnerSrcs(reduceRound(loserSrcs(waveRoundsSourceIds[0])));
+    for (let w = 1; w < waveRoundsSourceIds.length; w++) {
+      let waveItems = loserSrcs(waveRoundsSourceIds[w]);
+      while (survivors.length > waveItems.length) survivors = winnerSrcs(reduceRound(survivors));
+      while (waveItems.length > survivors.length) waveItems = winnerSrcs(reduceRound(waveItems));
+      survivors = winnerSrcs(mergeRound(survivors, waveItems));
+    }
+    while (survivors.length > 1) survivors = winnerSrcs(reduceRound(survivors));
+    return { championSource: survivors[0], rounds: lbRoundsOut, totalRounds: lbRoundIdx };
+  }
+
+  const lb1 = buildLoserBracket(wbLoserWaves, "LB1");
+  const lb2 = buildLoserBracket(lb1.rounds, "LB2");
+  // sf: voittajien kaavion linjan mestari (1 häviö) vs kahdesti hävinneiden
+  // kaavion mestari (2 häviötä). Jos 1-häviön pelaaja häviää tämän, hänellä on
+  // vasta 2 häviötä - hän EI saa tippua, vaan pelataan uusintaottelu (sfr).
+  // Jos 2-häviön pelaaja häviää, se on hänen 3. häviönsä ja hän tippuu
+  // normaalisti, jolloin sfr-ottelua ei tarvita (automaattinen vapaapari).
+  const sf = newMatch("SF", 1, lb1.championSource, lb2.championSource);
+  const sfr = newMatch("SF", 2, { type: "winner", ref: sf.id }, { type: "loserIfSlot", ref: sf.id, slot: 1 });
+  const final = newMatch("F", 1, { type: "winner", ref: wbChampionMatch.id }, { type: "winner", ref: sfr.id });
+
+  return {
+    matches: allMatches,
+    finalMatchId: final.id,
+    totalRounds: { WB: wbTotalRounds, LB1: lb1.totalRounds, LB2: lb2.totalRounds, SF: 2, F: 1 },
+  };
+}
+
+function triplaShuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Places `names` into bracket seed slots so byes land in at most one slot
+// per round-1 match — never two byes facing each other. Ported from
+// triplacup.html's computeByePlacement.
+function computeTriplaByePlacement(names, randomize, size) {
+  const n = names.length;
+  const r1Matches = size / 2;
+  const byes = size - n;
+  const pool = randomize ? triplaShuffle(names) : names.slice();
+  const hasBye = new Array(r1Matches).fill(false);
+  if (randomize) {
+    triplaShuffle([...Array(r1Matches).keys()]).slice(0, byes).forEach((idx) => (hasBye[idx] = true));
+  } else {
+    for (let i = r1Matches - byes; i < r1Matches; i++) hasBye[i] = true;
+  }
+  const slots = new Array(size).fill(null);
+  let idx = 0;
+  for (let m = 0; m < r1Matches; m++) {
+    if (hasBye[m]) {
+      const byeSide = randomize && Math.random() < 0.5 ? 1 : 0;
+      slots[2 * m + byeSide] = pool[idx++];
+      slots[2 * m + (1 - byeSide)] = null;
+    } else {
+      slots[2 * m] = pool[idx++];
+      slots[2 * m + 1] = pool[idx++];
+    }
+  }
+  return slots;
+}
+
+// Resolves one bracket match's slots/winner/loser given the current winners
+// map ({matchId: 0|1}) and seed name array. Recursive with a local memo —
+// cheap enough to recompute on every render for a 16/32-player bracket.
+function computeTriplaResult(id, matchesById, winners, seeds, memo) {
+  if (memo[id]) return memo[id];
+  const m = matchesById[id];
+  function resolveSlot(source) {
+    if (source.type === "seed") {
+      const p = seeds[source.ref];
+      return { name: p === null || p === undefined ? null : p, pending: false };
+    }
+    if (source.type === "loserIfSlot") {
+      const r = computeTriplaResult(source.ref, matchesById, winners, seeds, memo);
+      if (r.loserPending) return { name: null, pending: true };
+      // Only a real (non-bye) decided match has a meaningful loserSlot. If the
+      // loser didn't come from the requested slot (or there was no real
+      // loser at all, e.g. a bye), this slot resolves empty - which makes the
+      // enclosing match an automatic bye further down (no rematch needed).
+      if (r.loserSlot === source.slot) return { name: r.loserName, pending: false };
+      return { name: null, pending: false };
+    }
+    const r = computeTriplaResult(source.ref, matchesById, winners, seeds, memo);
+    return source.type === "winner"
+      ? { name: r.winnerName, pending: r.winnerPending }
+      : { name: r.loserName, pending: r.loserPending };
+  }
+  const s1 = resolveSlot(m.p1);
+  const s2 = resolveSlot(m.p2);
+  let out;
+  if (s1.pending || s2.pending) {
+    out = { p1: s1, p2: s2, winnerName: null, winnerPending: true, loserName: null, loserPending: true, ready: false, isBye: false, decided: false };
+  } else {
+    const s1Empty = s1.name === null;
+    const s2Empty = s2.name === null;
+    if (s1Empty && s2Empty) {
+      out = { p1: s1, p2: s2, winnerName: null, winnerPending: false, loserName: null, loserPending: false, ready: false, isBye: false, decided: false, empty: true };
+    } else if (s1Empty || s2Empty) {
+      const winnerName = s1Empty ? s2.name : s1.name;
+      out = { p1: s1, p2: s2, winnerName, winnerPending: false, loserName: null, loserPending: false, ready: true, isBye: true, decided: true, winnerSlot: s1Empty ? 2 : 1, loserSlot: null };
+    } else {
+      const w = winners[id];
+      const decided = w === 0 || w === 1;
+      const winnerName = decided ? (w === 0 ? s1.name : s2.name) : null;
+      const loserName = decided ? (w === 0 ? s2.name : s1.name) : null;
+      out = {
+        p1: s1, p2: s2, winnerName, winnerPending: !decided, loserName, loserPending: !decided, ready: true, isBye: false, decided,
+        winnerSlot: decided ? (w === 0 ? 1 : 2) : null,
+        loserSlot: decided ? (w === 0 ? 2 : 1) : null,
+      };
+    }
+  }
+  memo[id] = out;
+  return out;
+}
+
+// Derives everything the UI needs from raw bracket state (definition +
+// recorded winners + seed names). Pure/top-level so the interactive control
+// view and the read-only display view compute the exact same thing from
+// the exact same inputs.
+function deriveTriplaBracketState(bracketDef, bracketWinners, bracketSeeds) {
+  const bracketMatchesById = {};
+  bracketDef.forEach((m) => (bracketMatchesById[m.id] = m));
+
+  const bracketResults = {};
+  bracketDef.forEach((m) => computeTriplaResult(m.id, bracketMatchesById, bracketWinners, bracketSeeds, bracketResults));
+
+  const bracketDependents = {};
+  bracketDef.forEach((m) => (bracketDependents[m.id] = []));
+  bracketDef.forEach((m) => {
+    [m.p1, m.p2].forEach((s) => { if (s.type !== "seed") bracketDependents[s.ref].push(m.id); });
+  });
+
+  const winnerTargetOf = {}, loserTargetOf = {};
+  bracketDef.forEach((m) => {
+    [m.p1, m.p2].forEach((s) => {
+      if (s.type === "winner") winnerTargetOf[s.ref] = m.id;
+      else if (s.type === "loser") loserTargetOf[s.ref] = m.id;
+    });
+  });
+  const bracketTargets = { winnerTargetOf, loserTargetOf };
+
+  function bracketLossCount(name) {
+    if (!name) return 0;
+    let c = 0;
+    bracketDef.forEach((m) => { if (bracketResults[m.id]?.loserName === name) c++; });
+    return c;
+  }
+
+  return { bracketMatchesById, bracketResults, bracketDependents, bracketTargets, bracketLossCount };
+}
+
+// Full final standings once the tournament is over. Only the F (final),
+// SF/SFR (semifinal + its conditional rematch) and LB2 matches ever produce
+// a genuine 3rd loss / elimination - WB and LB1 losses only move a player
+// sideways into the next bracket, they never drop anyone out. So placement
+// is: 1st = champion, 2nd = final loser, 3rd = whoever is eliminated at the
+// SF/SFR stage, then LB2's rounds back-to-front, with everyone eliminated
+// in the same round tied at the same rank range.
+function computeTriplaStandingsPure(bracketDef, bracketResults, bracketFinalId) {
+  if (!bracketFinalId) return [];
+  const finalResult = bracketResults[bracketFinalId];
+  if (!finalResult || !finalResult.decided) return [];
+
+  const sfMatch = bracketDef.find((m) => m.sec === "SF" && m.roundIndex === 1);
+  const sfrMatch = bracketDef.find((m) => m.sec === "SF" && m.roundIndex === 2);
+  let sfEliminee = null;
+  if (sfMatch) {
+    const sfRes = bracketResults[sfMatch.id];
+    const sfrRes = sfrMatch ? bracketResults[sfrMatch.id] : null;
+    if (sfrRes && sfrRes.decided && !sfrRes.isBye) {
+      sfEliminee = sfrRes.loserName;
+    } else if (sfRes && sfRes.decided) {
+      sfEliminee = sfRes.loserName;
+    }
+  }
+
+  const lb2ByRound = {};
+  bracketDef.forEach((m) => {
+    if (m.sec !== "LB2") return;
+    const res = bracketResults[m.id];
+    if (res && res.decided && !res.isBye && res.loserName) {
+      (lb2ByRound[m.roundIndex] = lb2ByRound[m.roundIndex] || []).push(res.loserName);
+    }
+  });
+  const lb2RoundsDesc = Object.keys(lb2ByRound).map(Number).sort((a, b) => b - a);
+
+  const tiers = [
+    [finalResult.winnerName],
+    [finalResult.loserName],
+    sfEliminee ? [sfEliminee] : [],
+    ...lb2RoundsDesc.map((r) => lb2ByRound[r].slice().sort((a, b) => a.localeCompare(b, "fi"))),
+  ];
+
+  const rows = [];
+  let rank = 1;
+  tiers.forEach((tier) => {
+    if (tier.length === 0) return;
+    const label = tier.length === 1 ? `${rank}.` : `${rank}.-${rank + tier.length - 1}.`;
+    tier.forEach((name) => rows.push({ rankLabel: label, name }));
+    rank += tier.length;
+  });
+  return rows;
+}
+
+// Pure JSX renderer for one bracket match card. `onUndo` is optional - pass
+// it (a function) for the interactive control view, leave it undefined for
+// the read-only display view so no "Kumoa tulos" button is rendered there.
+function renderTriplaMatchCardPure({ id, bracketMatchesById, bracketResults, bracketTargets, triplaSearchTerm, bracketLossCount, onUndo }) {
+  const m = bracketMatchesById[id];
+  const r = bracketResults[id];
+  if (!m || !r) return null;
+  const isSfMatch = m.sec === "SF" && m.roundIndex === 1;
+  const isSfrMatch = m.sec === "SF" && m.roundIndex === 2;
+  const secBorder = { WB: "border-l-[#3e8e5b]", LB1: "border-l-[#d38a3f]", LB2: "border-l-[#c0392b]", SF: "border-l-[#e7c977]", F: "border-l-[#e7c977]" }[m.sec];
+  const term = (triplaSearchTerm || "").trim().toLowerCase();
+  const highlighted = term && ((r.p1.name || "").toLowerCase().includes(term) || (r.p2.name || "").toLowerCase().includes(term));
+  const winTarget = bracketTargets.winnerTargetOf[id];
+  const loseTarget = bracketTargets.loserTargetOf[id];
+  const winText = winTarget != null ? `Voittaja → Ottelu ${winTarget}` : "🏆 Voittaja on turnauksen mestari";
+  let loseText = loseTarget != null
+    ? `Häviäjä → Ottelu ${loseTarget} (${TRIPLA_SECTION_LABELS[bracketMatchesById[loseTarget].sec].title})`
+    : (m.sec === "F" ? "Häviäjä = 2. sija" : "Häviäjä eliminoituu turnauksesta");
+  if (isSfMatch) {
+    loseText = `Häviäjä: voittajien kaavion linjan pelaaja saa uusintaottelun (Ottelu ${winTarget}) — kahdesti hävinneiden kaavion linjan pelaaja tippuu turnauksesta (3. häviö).`;
+  }
+
+  if (r.isBye) {
+    const byeTag = isSfrMatch ? "ei uusintaa tarvittu" : "vapaapari";
+    const byeSubtitle = isSfrMatch ? "voitti välierän suoraan, ei häviötä" : "ei vastustajaa";
+    return (
+      <div key={id} className={`bg-[#152a20] border border-[#264536] ${secBorder} border-l-4 rounded-lg min-w-[170px] overflow-hidden opacity-90 ${highlighted ? "ring-2 ring-[#e7c977]" : ""}`}>
+        <div className="text-[10px] text-[#7a9484] px-2 pt-1.5">Ottelu {id}</div>
+        <div className="px-2 py-1.5 text-sm flex justify-between items-center">
+          <span className="text-[#e7c977] font-semibold">{r.winnerName}</span>
+          <span className="text-[10px] bg-[#1b3327] text-[#8fa396] rounded px-1.5 py-0.5">{byeTag}</span>
+        </div>
+        <div className="px-2 py-1.5 text-xs text-[#8fa396] italic border-t border-[#264536]">{byeSubtitle}</div>
+        <div className="text-[10px] text-[#7a9484] px-2 py-1.5 border-t border-dashed border-[#264536]">{winText}<br />{loseText}</div>
+      </div>
+    );
+  }
+
+  const slotEl = (slotData, key) => {
+    if (slotData.pending) return <div key={key} className="px-2 py-1.5 text-xs text-[#8fa396] italic border-t border-[#264536] first:border-t-0">odottaa</div>;
+    if (slotData.name === null) return <div key={key} className="px-2 py-1.5 text-xs text-[#8fa396] italic border-t border-[#264536] first:border-t-0">ei vastustajaa</div>;
+    const name = slotData.name;
+    let cls = "px-2 py-1.5 text-sm flex justify-between items-center gap-2 border-t border-[#264536] first:border-t-0";
+    if (r.decided) cls += r.winnerName === name ? " text-[#e7c977] font-semibold" : " text-[#7a9484] line-through";
+    return (
+      <div key={key} className={cls}>
+        <span>{name}</span>
+        {!r.decided && <span className="text-[10px] bg-[#1b3327] text-[#8fa396] rounded px-1.5 py-0.5 shrink-0">{bracketLossCount(name)} tapp.</span>}
+      </div>
+    );
+  };
+
+  return (
+    <div key={id} className={`bg-[#152a20] border border-[#264536] ${secBorder} border-l-4 rounded-lg min-w-[170px] overflow-hidden ${highlighted ? "ring-2 ring-[#e7c977]" : ""}`}>
+      <div className="text-[10px] text-[#7a9484] px-2 pt-1.5">Ottelu {id}{isSfrMatch && !r.decided ? " · uusintaottelu" : ""}</div>
+      {slotEl(r.p1, "p1")}
+      {slotEl(r.p2, "p2")}
+      {r.decided && onUndo && (
+        <div className="px-2 pb-1.5"><button onClick={() => onUndo(id)} className="text-[10px] text-[#7a9484] underline hover:text-[#a9c2ae]">Kumoa tulos</button></div>
+      )}
+      <div className="text-[10px] text-[#7a9484] px-2 py-1.5 border-t border-dashed border-[#264536]">{winText}<br />{loseText}</div>
+    </div>
+  );
+}
+
+// Pure JSX renderer for one whole bracket section (WB/LB1/LB2/SF/F), all
+// its rounds stacked. Same optional `onUndo` passthrough as above.
+function renderTriplaSectionPure({ sec, bracketDef, bracketMatchesById, bracketTotalRounds, bracketResults, bracketTargets, triplaSearchTerm, bracketLossCount, onUndo, rules }) {
+  const info = TRIPLA_SECTION_LABELS[sec];
+  const ids = bracketDef.filter((m) => m.sec === sec).map((m) => m.id);
+  if (ids.length === 0) return null;
+  const rounds = {};
+  ids.forEach((id) => {
+    const m = bracketMatchesById[id];
+    (rounds[m.roundIndex] = rounds[m.roundIndex] || []).push(id);
+  });
+  const roundKeys = Object.keys(rounds).map(Number).sort((a, b) => a - b);
+  const total = bracketTotalRounds[sec];
+  const secTextColor = { WB: "text-[#8fd19e]", LB1: "text-[#e0a35c]", LB2: "text-[#e8a0a0]", SF: "text-[#e7c977]", F: "text-[#e7c977]" }[sec];
+  return (
+    <div key={sec} className="mb-6">
+      <div className="flex items-baseline gap-2 mb-2 border-b border-[#2d4a37] pb-1.5">
+        <h3 className={`text-sm font-semibold uppercase tracking-wide ${secTextColor}`}>{info.title}</h3>
+        <span className="text-[10px] text-[#7a9484]">{info.tag}</span>
+      </div>
+      {roundKeys.map((rIdx) => (
+        <div key={rIdx} className="mb-3">
+          {total > 1 && (
+            <div className="text-[10px] text-[#7a9484] uppercase tracking-wide mb-1.5">
+              {sec === "SF"
+                ? (rIdx === 1 ? "Välierä" : "Uusintaottelu (vain jos kahdesti hävinneiden kaavion mestari voittaa välierän)")
+                : (rIdx === total ? "Lohkon finaali" : `Kierros ${rIdx}`)}
+              {rules && <span className="normal-case tracking-normal text-[#a9c2ae]"> · {boTxt(boFor(rules, bracketMatchesById[rounds[rIdx][0]], bracketTotalRounds), true)}</span>}
+            </div>
+          )}
+          {total <= 1 && rules && <div className="text-[10px] text-[#a9c2ae] mb-1.5">{boTxt(boFor(rules, bracketMatchesById[rounds[rIdx][0]], bracketTotalRounds))}</div>}
+          <div className="flex gap-2.5 flex-wrap">
+            {rounds[rIdx].map((id) => renderTriplaMatchCardPure({ id, bracketMatchesById, bracketResults, bracketTargets, triplaSearchTerm, bracketLossCount, onUndo }))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function QrCode({ text, size }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.innerHTML = "";
+    try { if (window.QRCode) new window.QRCode(el, { text, width: size, height: size, colorDark: "#0b1f16", colorLight: "#f2ede1" }); } catch (e) {}
+  }, [text, size]);
+  if (!window.QRCode) return null; // QR-kirjasto ei latautunut: osoite näkyy tekstinä
+  return <div ref={ref} className="bg-[#f2ede1] p-1.5 rounded inline-block" style={{ minWidth: size + 12, minHeight: size + 12 }} />;
+}
+function TabletPanel({ link, srvOk, srvInfo, pilvi, setPilvi, kirjaus, setKirjaus, srvMsg }) {
+  const [open, setOpen] = useState(true);
+  const [sel, setSel] = useState("taulu");
+  const [copied, setCopied] = useState("");
+  const [sivutDraft, setSivutDraft] = useState(pilvi.sivut || "");
+  const cloud = pilvi.mode === "pilvi";
+  const base = pagesBase(pilvi);
+  const targets = [];
+  if (cloud) {
+    if (base) {
+      targets.push({ id: "taulu", label: "📱 Tabletit", url: `${base}taulu.html?k=${pilvi.code}`, help: "Avaa jokaisella taulun tabletilla tai puhelimella ja valitse taulun numero." });
+      targets.push({ id: "boards", label: "📺 Taulut-näyttö", url: `${base}?view=boards&k=${pilvi.code}`, help: "Iso näyttö millä tahansa koneella tai älytelevisiolla: tauluilla nyt pelattavat ottelut ja tilanteet livenä." });
+      targets.push({ id: "bracket", label: "🏆 Kaavio-näyttö", url: `${base}?view=bracket&k=${pilvi.code}`, help: "Iso näyttö: turnauksen kaavio ja tilanne." });
+      targets.push({ id: "jatka", label: "↪ Jatka toisella laitteella", url: `${base}?jatka=${pilvi.code}`, help: "Siirtää turnauksen vetämisen toiseen laitteeseen (esim. jos tämän akku loppuu). Sulje Triplacup tästä laitteesta siirron jälkeen." });
+    }
+  } else if (srvInfo && srvInfo.ips) {
+    srvInfo.ips.slice(0, 3).forEach((ip, i) => targets.push({ id: i ? "taulu" + i : "taulu", label: `📱 Tabletit${srvInfo.ips.length > 1 ? " (" + ip + ")" : ""}`, url: `http://${ip}:${srvInfo.port}/taulu`, help: "Avaa tabletin tai puhelimen selaimella ja valitse taulun numero. Laitteen on oltava samassa WiFissä kuin tämä kone." }));
+  }
+  const cur = targets.find((t) => t.id === sel) || targets[0];
+  const status = !link
+    ? (cloud ? "ei käytössä" : "triplacup-palvelinta ei löydy")
+    : srvOk ? (cloud ? "yhdistetty internetin kautta" : "palvelin yhdistetty") : (cloud ? "ei yhteyttä – tarkista nettiyhteys" : "ei yhteyttä palvelimeen");
+  const doCopy = (t) => copyText(t.url).then(() => { setCopied(t.id); setTimeout(() => setCopied(""), 1500); });
+  const newCode = () => {
+    if (!window.confirm("Luodaanko uusi turnauskoodi? Kaikki tabletit ja näytöt pitää avata uudelleen uudella QR-koodilla.")) return;
+    setPilvi({ ...pilvi, code: TCLink.randCode(20) });
+  };
+  const btn = "text-[11px] px-2 py-1 rounded border";
+  return (
+    <div className="mb-5 bg-[#0f1c2a] border border-[#2c4a63] rounded-lg p-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={`w-2.5 h-2.5 rounded-full ${link && srvOk ? "bg-[#4ade80]" : "bg-[#c0392b]"}`} />
+        <h3 className="text-sm font-semibold text-[#7fb4e3]">📱 Tablettikirjaus</h3>
+        <span className="text-[11px] text-[#7a9484]">{status}</span>
+        {srvMsg && <span className="text-[11px] text-[#8fd19e] ml-2">{srvMsg}</span>}
+        <span className="ml-auto flex items-center gap-2">
+          {srvInfo && (
+            <span className="flex rounded overflow-hidden border border-[#2c4a63]">
+              {[["pilvi", "🌐 Internet"], ["lahi", "📶 Lähiverkko"]].map(([m, l]) => (
+                <button key={m} onClick={() => setPilvi({ ...pilvi, mode: m })} className={`text-[11px] px-2 py-1 ${pilvi.mode === m ? "bg-[#2c4a63] text-[#f2ede1]" : "text-[#7fb4e3]"}`}>{l}</button>
+              ))}
+            </span>
+          )}
+          <button onClick={() => setOpen(!open)} className="text-[11px] text-[#5b9bd5] underline">{open ? "Piilota" : "Näytä"}</button>
+        </span>
+      </div>
+      {open && (
+        <div className="mt-3 flex gap-4 flex-wrap items-start">
+          {cur ? (
+            <div className="text-center">
+              <QrCode text={cur.url} size={128} />
+              <div className="text-[11px] text-[#f2ede1] mt-1 font-semibold">{cur.label}</div>
+            </div>
+          ) : null}
+          <div className="flex-1 min-w-[240px] text-xs text-[#a9c2ae] space-y-2">
+            {cloud && !base && (
+              <div className="space-y-1">
+                <p>Kerro, mistä osoitteesta Triplacup ja tablettisivu avataan (GitHub Pages), niin QR-koodit voidaan muodostaa. Kun avaat Triplacupin tuosta osoitteesta, tämä täyttyy itsestään.</p>
+                <div className="flex gap-2">
+                  <input value={sivutDraft} onChange={(e) => setSivutDraft(e.target.value)} placeholder="https://nimi.github.io/triplacup/" className="flex-1 bg-[#0b1f16] border border-[#3a5c46] rounded px-2 py-1 text-xs text-[#f2ede1]" />
+                  <button onClick={() => setPilvi({ ...pilvi, sivut: sivutDraft.trim() })} className={`${btn} border-[#5b9bd5] text-[#7fb4e3]`}>Tallenna</button>
+                </div>
+              </div>
+            )}
+            {!cloud && !srvInfo && <p>Lähiverkkokäyttöön Triplacup avataan triplacup-palvelimen kautta (KAYNNISTA-TRIPLACUP.bat).</p>}
+            {targets.length > 0 && (
+              <div className="space-y-1.5">
+                {targets.map((t) => (
+                  <div key={t.id} className={`flex items-center gap-2 flex-wrap rounded px-2 py-1 ${cur && cur.id === t.id ? "bg-[#132a3d]" : ""}`}>
+                    <button onClick={() => setSel(t.id)} className="text-left text-[12px] text-[#f2ede1] font-medium min-w-[150px]">{t.label}</button>
+                    <span className="font-mono text-[10px] text-[#7a9484] break-all flex-1 min-w-[160px]">{t.url}</span>
+                    <button onClick={() => setSel(t.id)} className={`${btn} border-[#2c4a63] text-[#7fb4e3]`}>QR</button>
+                    <button onClick={() => doCopy(t)} className={`${btn} border-[#2c4a63] text-[#7fb4e3]`}>{copied === t.id ? "✓ Kopioitu" : "Kopioi"}</button>
+                    {t.id !== "taulu" && t.id !== "jatka" && <a href={t.url} target="_blank" rel="noopener" className={`${btn} border-[#2c4a63] text-[#7fb4e3]`}>Avaa</a>}
+                  </div>
+                ))}
+                {cur && <p className="text-[11px] text-[#7a9484]">{cur.help}</p>}
+              </div>
+            )}
+            <p>Kun ottelu käynnistetään taululle, se ilmestyy taulun tabletille. Tabletin vahvistama tulos merkitsee voittajan kaavioon automaattisesti. Voittajan voi edelleen merkitä myös käsin.</p>
+            <p className="text-[11px] text-[#7a9484]">Tabletit saavat ottelun säännöt automaattisesti: {rulesLine(kirjaus)}. Ottelun pituus kaavion osan mukaan (ks. Ottelusäännöt).</p>
+            {cloud && (
+              <div className="flex gap-2 flex-wrap items-center text-[11px] text-[#7a9484] pt-1 border-t border-[#1c3448]">
+                <span>Turnauskoodi <span className="font-mono text-[#a9c2ae]">{pilvi.code}</span></span>
+                <button onClick={newCode} className="underline text-[#5b9bd5]">Uusi koodi</button>
+                {base && <button onClick={() => { setSivutDraft(pilvi.sivut); setPilvi({ ...pilvi, sivut: "" }); }} className="underline text-[#5b9bd5]">Vaihda sivujen osoite</button>}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// REM: Ottelusääntöjen muokkaus (kuten ACRHI DARTSin Tuplacup) - ohjelman tekijä: Johannes Ketola
+function RulesEditor({ rules, setRules, size, bracketDef, bracketTotalRounds, running }) {
+  const def = useMemo(() => {
+    if (bracketDef && bracketDef.length) return { matches: bracketDef, totalRounds: bracketTotalRounds || {} };
+    const b = buildTriplaBracketDef(size || 16);
+    return { matches: b.matches, totalRounds: b.totalRounds };
+  }, [bracketDef, bracketTotalRounds, size]);
+  const counts = useMemo(() => {
+    const c = {};
+    def.matches.forEach((m) => { const k = boKeyOf(m, def.totalRounds); c[k] = (c[k] || 0) + 1; });
+    return c;
+  }, [def]);
+  const W = def.totalRounds.WB || 4;
+  const rows = [];
+  for (let r = 1; r <= Math.min(W, 6); r++) rows.push({ k: "w" + r, name: r === W ? "Voittajien kaavion finaali" : `Voittajien kaavio · kierros ${r}`, cls: "text-[#8fd19e]" });
+  rows.push({ k: "l1", name: "1. hävinneiden kaavio", cls: "text-[#e0a35c]" });
+  rows.push({ k: "l1f", name: "1. hävinneiden kaavion finaali", cls: "text-[#e0a35c]" });
+  rows.push({ k: "l2", name: "2. hävinneiden kaavio", cls: "text-[#e8a0a0]" });
+  rows.push({ k: "l2f", name: "2. hävinneiden kaavion finaali", cls: "text-[#e8a0a0]" });
+  rows.push({ k: "sf", name: "Välierä (ja uusinta)", cls: "text-[#e7c977]" });
+  rows.push({ k: "f", name: "Finaali", cls: "text-[#e7c977]" });
+  const [own, setOwn] = useState(() => ([301, 501, 701].includes(rules.start) ? "" : String(rules.start)));
+  const ownN = Math.round(Number(own));
+  const ownOk = own !== "" && /^\d+$/.test(own.trim()) && ownN >= 101 && ownN <= 2000;
+  const ownSel = ![301, 501, 701].includes(rules.start);
+  const set = (patch) => setRules({ ...rules, ...patch });
+  const setBo = (k, v) => setRules({ ...rules, preset: "", bo: { ...rules.bo, [k]: clampBo(v) } });
+  const pill = (on) => `px-3 py-1.5 rounded border text-sm font-semibold ${on ? "bg-[#e7c977] text-[#0b1f16] border-[#e7c977]" : "bg-[#0b1f16] text-[#f2ede1] border-[#3a5c46] hover:border-[#e7c977]"}`;
+  const stepBtn = "w-9 h-9 rounded border border-[#3a5c46] text-lg text-[#e7c977] disabled:opacity-30 hover:border-[#e7c977]";
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-sm font-semibold text-[#e7c977] mb-1.5">Pelimuoto</div>
+        <div className="flex flex-wrap gap-2 items-center">
+          {[301, 501, 701].map((v) => <button key={v} type="button" onClick={() => { set({ start: v }); setOwn(""); }} className={pill(rules.start === v)}>{v}</button>)}
+          <span className={`flex items-center gap-1.5 rounded border px-2 py-1 ${ownSel ? "border-[#e7c977]" : "border-[#3a5c46]"}`}>
+            <span className="text-xs text-[#a9c2ae]">Oma</span>
+            <input value={own} inputMode="numeric" placeholder="101–2000"
+              onChange={(e) => { const t = e.target.value.replace(/[^\d]/g, "").slice(0, 4); setOwn(t); const n = Number(t); if (n >= 101 && n <= 2000) set({ start: n }); }}
+              className="w-20 bg-[#0b1f16] border border-[#3a5c46] rounded px-2 py-1 text-sm text-[#f2ede1]" />
+          </span>
+          <span className="text-xs text-[#7a9484]">tupla ulos</span>
+        </div>
+        {own !== "" && !ownOk && <p className="text-xs text-[#e8a0a0] mt-1">Pelimuodon pitää olla 101–2000.</p>}
+      </div>
+      <div>
+        <div className="text-sm font-semibold text-[#e7c977] mb-1.5">Ottelun pituus</div>
+        <div className="flex flex-wrap gap-2 mb-2">
+          {[["short", "LYHYT"], ["normal", "NORMAALI"], ["long", "PITKÄ"]].map(([k, l]) => (
+            <button key={k} type="button" onClick={() => setRules({ ...rules, preset: k, bo: { ...rules.bo, ...presetBo(k, size) } })} className={pill(rules.preset === k)}>{l}</button>
+          ))}
+          {!rules.preset && <span className="text-xs text-[#7a9484] self-center">oma määrittely</span>}
+        </div>
+        <div className="grid gap-1.5 sm:grid-cols-2">
+          {rows.map((r) => {
+            const v = clampBo(rules.bo[r.k]);
+            const n = counts[r.k] || 0;
+            return (
+              <div key={r.k} className="flex items-center gap-2 bg-[#0b1f16] border border-[#264536] rounded px-2.5 py-1.5">
+                <div className="flex-1 min-w-0">
+                  <div className={`text-[13px] font-medium ${r.cls} truncate`}>{r.name}</div>
+                  <div className="text-[10px] text-[#7a9484]">{n} {n === 1 ? "ottelu" : "ottelua"}</div>
+                </div>
+                <button type="button" className={stepBtn} disabled={v <= 1} onClick={() => setBo(r.k, v - 2)} aria-label="Lyhyempi">−</button>
+                <div className="w-[92px] text-center leading-tight">
+                  <div className="text-[13px] font-semibold text-[#f2ede1]">{boTxt(v)}</div>
+                  <div className="text-[10px] text-[#a9c2ae]"><b>{(v + 1) / 2}</b> {v === 1 ? "voitto" : "voittoon"}</div>
+                </div>
+                <button type="button" className={stepBtn} disabled={v >= BO_MAX} onClick={() => setBo(r.k, v + 2)} aria-label="Pidempi">+</button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div>
+        <div className="text-sm font-semibold text-[#e7c977] mb-1.5">Tiebreak</div>
+        <div className="flex flex-wrap gap-2 items-center">
+          <button type="button" onClick={() => set({ tb: false })} className={pill(!rules.tb)}>EI TIEBREAKIÄ</button>
+          <button type="button" onClick={() => set({ tb: true })} className={pill(rules.tb)}>TIEBREAK</button>
+          {rules.tb && (
+            <label className="flex items-center gap-2 text-sm text-[#f2ede1]">
+              <input type="range" min="9" max="99" step="3" value={rules.tbDarts} onChange={(e) => set({ tbDarts: clampTb(e.target.value) })} className="w-40 accent-[#e7c977]" />
+              <b>{rules.tbDarts}</b> <span className="text-xs text-[#a9c2ae]">tikkaa ({rules.tbDarts / 3} kierrosta)</span>
+            </label>
+          )}
+        </div>
+        <p className="text-xs text-[#7a9484] mt-1.5">
+          {rules.tb
+            ? `Jos legiä ei ole lopetettu, kun kumpikin on heittänyt ${rules.tbDarts} tikkaa, molemmat heittävät yhden vuoron ja suurempi tulos voittaa legin. Tasatuloksella heitetään uudelleen. Tabletti näyttää ennen viimeistä kierrosta varoituksen "TÄMÄN KIERROKSEN JÄLKEEN ALKAA TIEBREAK!".`
+            : "Legit pelataan loppuun asti."}
+        </p>
+      </div>
+      {running && <p className="text-xs text-[#a9c2ae] bg-[#0f1c2a] border border-[#2c4a63] rounded px-3 py-2">Muutokset koskevat otteluita, joita ei ole vielä aloitettu tabletilla – myös tauluilla odottavia. Tabletilla jo käynnissä olevat ottelut pelataan loppuun aloitussäännöillä.</p>}
+    </div>
+  );
+}
+
+// REM: Turnauksen siirto toiseen laitteeseen (?jatka=<koodi>) - ohjelman tekijä: Johannes Ketola
+function JatkaView({ code }) {
+  const [st, setSt] = useState({ phase: "load" });
+  useEffect(() => {
+    TCLink.cloud(PILVI_DB, code).load()
+      .then((saved) => setSt(saved && saved.session ? { phase: "ok", saved } : { phase: "empty" }))
+      .catch(() => setSt({ phase: "err" }));
+  }, [code]);
+  const here = loadSavedSession();
+  const take = () => {
+    try {
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(st.saved.session));
+      if (st.saved.roster) localStorage.setItem(ROSTER_STORAGE_KEY, JSON.stringify(st.saved.roster));
+      const p = loadPilvi();
+      localStorage.setItem(PILVI_KEY, JSON.stringify({ ...p, mode: "pilvi", code }));
+    } catch (e) {}
+    window.location.replace(window.location.pathname);
+  };
+  const s = st.saved && st.saved.session;
+  const players = s ? (s.bracketSeeds || s.setupPlayers || []).length : 0;
+  const at = st.saved && st.saved.at ? new Date(st.saved.at).toLocaleString("fi-FI") : "";
+  return (
+    <div className="min-h-screen bg-[#0b1f16] text-[#f2ede1] font-sans flex items-center justify-center px-4">
+      <div className="max-w-md w-full bg-[#132a1e] border border-[#2d4a37] rounded-lg p-5 space-y-3">
+        <h1 className="text-xl text-[#e7c977] font-semibold">↪ Jatka turnausta tällä laitteella</h1>
+        {st.phase === "load" && <p className="text-sm text-[#a9c2ae]">Haetaan turnausta…</p>}
+        {st.phase === "err" && <p className="text-sm text-[#e57373]">Turnausta ei saatu haettua. Tarkista nettiyhteys ja yritä uudelleen.</p>}
+        {st.phase === "empty" && <p className="text-sm text-[#a9c2ae]">Tällä koodilla ei löytynyt tallennettua turnausta.</p>}
+        {st.phase === "ok" && (
+          <>
+            <p className="text-sm text-[#a9c2ae]">Löytyi turnaus{players ? `, ${players} pelaajaa` : ""}{s.phase === "tournament" ? ", turnaus käynnissä" : ", valmisteluvaiheessa"}. Tallennettu {at}.</p>
+            {here && here.phase === "tournament" && <p className="text-sm text-[#e7c977]">⚠ Tämän laitteen oma keskeneräinen turnaus korvataan.</p>}
+            <p className="text-xs text-[#7a9484]">Siirron jälkeen sulje Triplacup alkuperäiseltä laitteelta, ettei kahta vetäjää ole yhtä aikaa. Tabletit ja näytöt jatkavat samalla koodilla.</p>
+            <button onClick={take} className="w-full bg-[#e7c977] text-[#0b1f16] font-semibold rounded py-2">Siirrä turnaus tähän laitteeseen</button>
+          </>
+        )}
+        <button onClick={() => window.location.replace(window.location.pathname)} className="w-full text-sm text-[#a9c2ae] underline">Peruuta</button>
+      </div>
+    </div>
+  );
+}
+
+// REM: Pääkomponentti Triplacup - ohjelman tekijä: Johannes Ketola
+function DartsParittaja() {
+  // Loaded ONCE on first render (useMemo with empty deps) — every relevant
+  // piece of state below hydrates from this if a crash-recovery snapshot
+  // exists, so reopening the page after a power loss resumes exactly where
+  // things were, whether that was mid-setup or mid-tournament.
+  const savedSession = useMemo(() => loadSavedSession(), []);
+
+  // REM: Sovelluksen tila (state) - ohjelman tekijä: Johannes Ketola
+  const [phase, setPhase] = useState(() => savedSession?.phase || "setup");
+  const [setupPlayers, setSetupPlayers] = useState(() => savedSession?.setupPlayers || []);
+  const [roster, setRoster] = useState(() => loadSavedRoster());
+  const [rosterPick, setRosterPick] = useState("");
+  const [newSetupName, setNewSetupName] = useState("");
+  const [newSetupSkill, setNewSetupSkill] = useState("");
+  const [newSetupSpeed, setNewSetupSpeed] = useState("");
+  const [bulkNames, setBulkNames] = useState("");
+  const [randomPlayerCount, setRandomPlayerCount] = useState(16);
+  const [activeBoardNumbers, setActiveBoardNumbers] = useState(() =>
+    savedSession?.activeBoardNumbers ? new Set(savedSession.activeBoardNumbers) : new Set([1, 2, 3, 4, 5, 6, 7])
+  );
+
+  // REM: Triplacup-turnauksen tila - ohjelman tekijä: Johannes Ketola
+  const [bracketSize, setBracketSize] = useState(() => savedSession?.bracketSize || 16);
+  const [triplaRandomDraw, setTriplaRandomDraw] = useState(true);
+  const [bracketDef, setBracketDef] = useState(() => savedSession?.bracketDef || []);
+  const [bracketFinalId, setBracketFinalId] = useState(() => savedSession?.bracketFinalId || null);
+  const [bracketTotalRounds, setBracketTotalRounds] = useState(() => savedSession?.bracketTotalRounds || {});
+  const [bracketSeeds, setBracketSeeds] = useState(() => savedSession?.bracketSeeds || []);
+  const [bracketWinners, setBracketWinners] = useState(() => savedSession?.bracketWinners || {});
+  const [bracketPlayerMeta, setBracketPlayerMeta] = useState(() => savedSession?.bracketPlayerMeta || {});
+  const [triplaBoards, setTriplaBoards] = useState(() =>
+    savedSession?.triplaBoards ||
+    Array.from({ length: BOARD_COUNT }, (_, i) => ({ id: i + 1, status: "free", disabled: false, matchId: null, p1Name: null, p2Name: null }))
+  );
+  const [triplaBoardAssign, setTriplaBoardAssign] = useState({});
+  const [triplaSearchTerm, setTriplaSearchTerm] = useState("");
+  const [triplaTick, setTriplaTick] = useState(() => savedSession?.triplaTick || 0);
+  const [bracketReadySince, setBracketReadySince] = useState(() => savedSession?.bracketReadySince || {});
+
+  const [notice, setNotice] = useState("");
+  const [kirjaus, setKirjaus] = useState(() => (savedSession && savedSession.rules ? normRules(savedSession.rules) : loadKirjaus()));
+  const [pilvi, setPilvi] = useState(() => loadPilvi());
+  const [srvInfo, setSrvInfo] = useState(null);
+  const [srvMsg, setSrvMsg] = useState("");
+  const [computing, setComputing] = useState(false);
+
+  // Undo history: an in-memory stack of snapshots (does NOT survive a
+  // reload — that's what the auto-save below is for). pushHistory() is
+  // called SYNCHRONOUSLY, as the very first line of every state-changing
+  // action, capturing exactly the state that existed right before that
+  // action — this is deliberately NOT inferred indirectly from a useEffect
+  // (an earlier version did that via a ref, but that made the history push
+  // depend on React's effect scheduling running before the next click,
+  // which is not something to rely on). This way "PERUUTA" is always
+  // guaranteed correct and immediate, no matter how fast you click —
+  // most commonly used to fix a misclicked match result, but it works the
+  // same way for any action.
+  const [history, setHistory] = useState([]);
+
+  // REM: Peruutushistoria (Peruuta-toiminto) - ohjelman tekijä: Johannes Ketola
+  function pushHistory() {
+    const snapshot = {
+      phase,
+      setupPlayers,
+      activeBoardNumbers: [...activeBoardNumbers],
+      bracketSize,
+      bracketDef,
+      bracketFinalId,
+      bracketTotalRounds,
+      bracketSeeds,
+      bracketWinners,
+      bracketPlayerMeta,
+      triplaBoards,
+      triplaTick,
+      bracketReadySince,
+    };
+    setHistory((prev) => [...prev, snapshot].slice(-50));
+  }
+
+  // Auto-save after every state-changing action (a click always changes at
+  // least one of these), so a laptop losing power mid-tournament never
+  // loses more than the single most recent, still-unsaved click.
+  useEffect(() => {
+    persistSession({
+      phase,
+      setupPlayers,
+      activeBoardNumbers: [...activeBoardNumbers],
+      bracketSize,
+      bracketDef,
+      bracketFinalId,
+      bracketTotalRounds,
+      bracketSeeds,
+      bracketWinners,
+      bracketPlayerMeta,
+      triplaBoards,
+      triplaTick,
+      bracketReadySince,
+      rules: kirjaus,
+    });
+  }, [
+    phase, setupPlayers, activeBoardNumbers,
+    bracketSize, bracketDef, bracketFinalId, bracketTotalRounds, bracketSeeds, bracketWinners, bracketPlayerMeta, triplaBoards,
+    triplaTick, bracketReadySince, kirjaus,
+  ]);
+
+  const undoLastAction = () => {
+    if (history.length === 0) {
+      setNotice("Ei mitään peruutettavaa.");
+      return;
+    }
+    const last = history[history.length - 1];
+    setHistory((prev) => prev.slice(0, -1));
+    setPhase(last.phase);
+    setSetupPlayers(last.setupPlayers);
+    setActiveBoardNumbers(new Set(last.activeBoardNumbers));
+    setBracketSize(last.bracketSize || 16);
+    setBracketDef(last.bracketDef || []);
+    setBracketFinalId(last.bracketFinalId || null);
+    setBracketTotalRounds(last.bracketTotalRounds || {});
+    setBracketSeeds(last.bracketSeeds || []);
+    setBracketWinners(last.bracketWinners || {});
+    setBracketPlayerMeta(last.bracketPlayerMeta || {});
+    setTriplaBoards(
+      last.triplaBoards ||
+      Array.from({ length: BOARD_COUNT }, (_, i) => ({ id: i + 1, status: "free", disabled: false, matchId: null, p1Name: null, p2Name: null }))
+    );
+    setTriplaTick(last.triplaTick || 0);
+    setBracketReadySince(last.bracketReadySince || {});
+    setNotice("Edellinen toiminto peruutettu.");
+  };
+
+  // REM: Asetusvaihe: pelaajien ja rekisterin hallinta - ohjelman tekijä: Johannes Ketola
+  const saveRosterPlayer = (name, skill, speed, boardRestrictions = undefined) => {
+    setRoster((prev) => {
+      const key = normalizeRosterName(name);
+      const existing = prev.find((p) => normalizeRosterName(p.name) === key);
+      const resolvedRestrictions = boardRestrictions === undefined
+        ? normalizeBoardRestrictions(existing?.boardRestrictions, name)
+        : normalizeBoardRestrictions(boardRestrictions, name);
+      const record = { name: name.trim(), skill, speed, boardRestrictions: resolvedRestrictions };
+      const next = existing
+        ? prev.map((p) => normalizeRosterName(p.name) === key ? { ...p, ...record } : p)
+        : [...prev, record];
+      const sorted = [...next].sort(rosterSort);
+      persistRoster(sorted);
+      return sorted;
+    });
+  };
+
+  const updateSetup = (index, field, value) => {
+    setSetupPlayers((prev) => {
+      const next = prev.map((p, i) => (i === index ? { ...p, [field]: value } : p));
+      const changed = next[index];
+      if (changed) saveRosterPlayer(changed.name, changed.skill, changed.speed);
+      return next;
+    });
+  };
+  const removeSetupPlayer = (index) => {
+    pushHistory();
+    setSetupPlayers((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const toggleSetupRestriction = (index, boardId) => {
+    setSetupPlayers((prev) => {
+      const next = prev.map((p, i) => {
+        if (i !== index) return p;
+        const current = new Set(normalizeBoardRestrictions(p.boardRestrictions, p.name));
+        if (current.has(boardId)) current.delete(boardId);
+        else current.add(boardId);
+        const boardRestrictions = [...current].sort((a, b) => a - b);
+        saveRosterPlayer(p.name, p.skill, p.speed, boardRestrictions);
+        return { ...p, boardRestrictions };
+      });
+      return next;
+    });
+  };
+
+  // Permanent player roster. Saved players override built-in values and
+  // newly added players stay available in every future tournament on this device.
+  const availableRoster = roster
+    .filter((p) => !setupPlayers.some((sp) => normalizeRosterName(sp.name) === normalizeRosterName(p.name)))
+    .sort(rosterSort);
+
+  const importBulkPlayers = () => {
+    const names = bulkNames
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (names.length === 0) {
+      setNotice("Liitä pelaajien nimet, yksi nimi riville.");
+      return;
+    }
+
+    const rosterByName = new Map(roster.map((p) => [normalizeRosterName(p.name), p]));
+    const existing = new Set(setupPlayers.map((p) => p.name.toLowerCase()));
+    const seen = new Set();
+    const imported = [];
+    const unknown = [];
+
+    for (const rawName of names) {
+      const key = rawName.toLowerCase();
+      if (seen.has(key) || existing.has(key)) continue;
+      seen.add(key);
+      const found = rosterByName.get(key);
+      if (found) {
+        imported.push({ name: found.name, skill: found.skill, speed: found.speed, boardRestrictions: normalizeBoardRestrictions(found.boardRestrictions, found.name) });
+      } else {
+        imported.push({ name: rawName, skill: "", speed: "", boardRestrictions: defaultBoardRestrictionsForName(rawName) });
+        unknown.push(rawName);
+      }
+    }
+
+    if (imported.length > 0) {
+      pushHistory();
+      setSetupPlayers((prev) => [...prev, ...imported]);
+      imported.forEach((p) => saveRosterPlayer(p.name, p.skill, p.speed));
+    }
+
+    setBulkNames("");
+    if (unknown.length > 0) {
+      setNotice(`${imported.length} pelaajaa tuotu. Näille pelaajille ei löytynyt valmiita arvoja: ${unknown.join(", ")}.`);
+    } else {
+      setNotice(`${imported.length} pelaajaa tuotu listasta. Tallennetut taito- ja nopeusarvot täytettiin automaattisesti.`);
+    }
+  };
+
+  const addFromRoster = () => {
+    if (!rosterPick) return;
+    const found = roster.find((p) => p.name === rosterPick);
+    if (!found) return;
+    const { name, skill, speed, boardRestrictions } = found;
+    pushHistory();
+    setSetupPlayers((prev) => [...prev, { name, skill, speed, boardRestrictions: normalizeBoardRestrictions(boardRestrictions, name) }]);
+    setRosterPick("");
+  };
+
+  const addRandomPlayers = () => {
+    const count = Math.max(8, Math.min(32, Number(randomPlayerCount) || 0));
+    const existing = new Set(setupPlayers.map((p) => normalizeRosterName(p.name)));
+    const candidates = roster.filter((p) => !existing.has(normalizeRosterName(p.name)));
+
+    if (candidates.length === 0) {
+      setNotice("Kaikki tallennetut heittäjät ovat jo turnauksessa.");
+      return;
+    }
+
+    const picked = triplaShuffle(candidates).slice(0, count);
+    const added = picked.map((p) => ({
+      name: p.name,
+      skill: p.skill,
+      speed: p.speed,
+      boardRestrictions: normalizeBoardRestrictions(p.boardRestrictions, p.name),
+    }));
+
+    pushHistory();
+    setSetupPlayers((prev) => [...prev, ...added].sort(rosterSort));
+    setNotice(
+      picked.length < count
+        ? `Tallennetussa rekisterissä oli vain ${picked.length} vielä lisäämätöntä heittäjää — kaikki ne lisättiin.`
+        : `${picked.length} satunnaista heittäjää lisätty turnaukseen.`
+    );
+  };
+
+  const addSetupPlayer = () => {
+    const trimmed = newSetupName.trim();
+    if (!trimmed) return;
+    if (setupPlayers.some((p) => normalizeRosterName(p.name) === normalizeRosterName(trimmed))) return;
+    const skill = newSetupSkill;
+    const speed = newSetupSpeed;
+    const boardRestrictions = defaultBoardRestrictionsForName(trimmed);
+    pushHistory();
+    setSetupPlayers((prev) => [...prev, { name: trimmed, skill, speed, boardRestrictions }]);
+    saveRosterPlayer(trimmed, skill, speed, boardRestrictions);
+    setNewSetupName("");
+    setNewSetupSkill("");
+    setNewSetupSpeed("");
+  };
+
+  const toggleSetupBoard = (num) => {
+    pushHistory();
+    setActiveBoardNumbers((prev) => {
+      const next = new Set(prev);
+      if (next.has(num)) {
+        if (next.size <= 2) return prev;
+        next.delete(num);
+      } else {
+        next.add(num);
+      }
+      return next;
+    });
+  };
+
+  // REM: Triplacup-turnauksen aloitus - ohjelman tekijä: Johannes Ketola
+  const startTriplacup = () => {
+    const names = setupPlayers.map((p) => p.name.trim()).filter(Boolean);
+    const min = bracketSize / 2, max = bracketSize;
+    if (names.length < min || names.length > max) {
+      setNotice(`${bracketSize} paikan triplacup vaatii ${min}–${max} osallistujaa (nyt ${names.length}).`);
+      return;
+    }
+
+    const slots = computeTriplaByePlacement(names, triplaRandomDraw, bracketSize);
+    setNotice("");
+
+    const built = buildTriplaBracketDef(bracketSize);
+    const meta = {};
+    setupPlayers.forEach((p) => {
+      meta[normalizeRosterName(p.name)] = { boardRestrictions: normalizeBoardRestrictions(p.boardRestrictions, p.name) };
+    });
+    setupPlayers.forEach((p) => saveRosterPlayer(p.name, p.skill, p.speed, p.boardRestrictions));
+
+    const freshTriplaBoards = Array.from({ length: BOARD_COUNT }, (_, i) => ({
+      id: i + 1, status: "free", disabled: !activeBoardNumbers.has(i + 1), matchId: null, p1Name: null, p2Name: null,
+    }));
+
+    pushHistory();
+    setBracketDef(built.matches);
+    setBracketFinalId(built.finalMatchId);
+    setBracketTotalRounds(built.totalRounds);
+    setBracketSeeds(slots);
+    setBracketWinners({});
+    setBracketPlayerMeta(meta);
+    setTriplaBoards(freshTriplaBoards);
+    setTriplaTick(0);
+    setBracketReadySince({});
+    setPhase("tournament");
+  };
+
+  // REM: Triplacupin ottelutulosten laskenta ja taulujen käyttö - ohjelman tekijä: Johannes Ketola
+  const { bracketMatchesById, bracketResults, bracketDependents, bracketTargets, bracketLossCount } = useMemo(
+    () => deriveTriplaBracketState(bracketDef, bracketWinners, bracketSeeds),
+    [bracketDef, bracketWinners, bracketSeeds]
+  );
+
+
+  const bracketAssignedMatchIds = useMemo(
+    () => new Set(triplaBoards.filter((b) => b.status === "playing").map((b) => b.matchId)),
+    [triplaBoards]
+  );
+
+  const triplaReadyMatchIds = bracketDef
+    .map((m) => m.id)
+    .filter((id) => {
+      const r = bracketResults[id];
+      return r && r.ready && !r.decided && !r.isBye && !bracketAssignedMatchIds.has(id);
+    });
+
+  const triplaChampionResult = bracketFinalId ? bracketResults[bracketFinalId] : null;
+
+  // Full final standings once the tournament is over.
+  const triplaStandings = useMemo(
+    () => computeTriplaStandingsPure(bracketDef, bracketResults, bracketFinalId),
+    [bracketDef, bracketResults, bracketFinalId]
+  );
+
+  // Stamps every match the moment it first becomes playable, so the
+  // suggestion engine can tell how long its players have already been
+  // waiting around for a board.
+  useEffect(() => {
+    if (bracketDef.length === 0) return;
+    const newlyReady = bracketDef
+      .map((m) => m.id)
+      .filter((id) => {
+        const r = bracketResults[id];
+        return r && r.ready && !r.isBye && bracketReadySince[id] === undefined;
+      });
+    if (newlyReady.length === 0) return;
+    setBracketReadySince((prev) => {
+      const next = { ...prev };
+      newlyReady.forEach((id) => { next[id] = triplaTick; });
+      return next;
+    });
+  }, [bracketDef, bracketResults, bracketReadySince, triplaTick]);
+
+  // True if finishing `matchId` right now would immediately turn at least
+  // one still-blocked match into a playable one (i.e. it unclogs the
+  // pipeline instead of just being "next in line" with nothing behind it).
+  function triplaMatchUnlocksSomething(matchId) {
+    const deps = bracketDependents[matchId] || [];
+    return deps.some((depId) => {
+      const depMatch = bracketMatchesById[depId];
+      const depResult = bracketResults[depId];
+      if (!depMatch || !depResult || depResult.decided) return false;
+      const refsThis = (slot) => slot.type !== "seed" && slot.ref === matchId;
+      const p1Refs = refsThis(depMatch.p1);
+      const p2Refs = refsThis(depMatch.p2);
+      if (p1Refs && p2Refs) return true; // e.g. the SF-rematch: both its slots resolve the instant SF is decided
+      const otherPending = p1Refs ? depResult.p2.pending : depResult.p1.pending;
+      return !otherPending;
+    });
+  }
+
+  // Picks the single best currently-unassigned, ready match for board
+  // `boardId`: prioritises matches that unblock further play (keeps the
+  // whole bracket moving instead of boards sitting idle later), then among
+  // equally useful matches picks whichever pair has been waiting longest so
+  // nobody's wait becomes painful. Excludes matches already restricted from
+  // this board, and matches already suggested (but not yet started) on
+  // other free boards, so two boards don't propose the same match at once.
+  const suggestTriplaMatchForBoard = (boardId) => {
+    const suggestedElsewhere = new Set(
+      Object.entries(triplaBoardAssign)
+        .filter(([bId]) => Number(bId) !== boardId)
+        .map(([, v]) => v)
+        .filter(Boolean)
+        .map(Number)
+    );
+    const candidates = triplaReadyMatchIds.filter((id) => {
+      if (suggestedElsewhere.has(id)) return false;
+      const r = bracketResults[id];
+      return !triplaBoardRestricted(r.p1.name, boardId) && !triplaBoardRestricted(r.p2.name, boardId);
+    });
+    if (candidates.length === 0) {
+      setNotice("Ei ehdotettavaa ottelua tälle taululle juuri nyt — kaikki pelikelpoiset ottelut ovat rajoitettuja tälle taululle, käynnissä muualla, tai jo ehdotettuina toiselle taululle.");
+      return;
+    }
+    let best = candidates[0], bestScore = -Infinity;
+    candidates.forEach((id) => {
+      const waitTicks = triplaTick - (bracketReadySince[id] ?? triplaTick);
+      const unlocks = triplaMatchUnlocksSomething(id) ? 1 : 0;
+      const score = unlocks * 1000 + waitTicks * 10 - id * 0.001; // tiny id tie-break keeps it deterministic
+      if (score > bestScore) { bestScore = score; best = id; }
+    });
+    setTriplaBoardAssign((prev) => ({ ...prev, [boardId]: String(best) }));
+    setNotice("");
+  };
+
+  function triplaBoardRestricted(name, boardId) {
+    const meta = bracketPlayerMeta[normalizeRosterName(name)];
+    return !!(meta && meta.boardRestrictions && meta.boardRestrictions.includes(boardId));
+  }
+
+  const assignTriplaMatch = (boardId, matchId) => {
+    const board = triplaBoards.find((b) => b.id === boardId);
+    const r = bracketResults[matchId];
+    if (!board || board.disabled || board.status !== "free" || !r || !r.ready || r.decided || r.isBye) return;
+    // Safety net: a match can look free in the dropdown (only pending
+    // there, not yet started) while another board starts it first. Without
+    // this check, accepting a stale suggestion/selection could put the
+    // SAME match on two boards at once.
+    if (bracketAssignedMatchIds.has(matchId)) {
+      setNotice("Tämä ottelu ehdittiin jo käynnistää toisella taululla — valitse toinen ottelu.");
+      setTriplaBoardAssign((prev) => ({ ...prev, [boardId]: "" }));
+      return;
+    }
+    pushHistory();
+    setTriplaBoards((prev) =>
+      prev.map((b) => (b.id === boardId ? { ...b, status: "playing", matchId, p1Name: r.p1.name, p2Name: r.p2.name, key: "m" + matchId + "-" + Date.now().toString(36) } : b))
+    );
+    // Clear this match out of every OTHER board's pending (not-yet-started)
+    // selection too, so no stale "Aloita" button can start it a second time.
+    setTriplaBoardAssign((prev) => {
+      const next = {};
+      Object.keys(prev).forEach((bId) => {
+        next[bId] = Number(bId) === boardId || Number(prev[bId]) === matchId ? "" : prev[bId];
+      });
+      return next;
+    });
+    setNotice("");
+  };
+
+  const finishTriplaMatch = (boardId, which) => {
+    const board = triplaBoards.find((b) => b.id === boardId);
+    if (!board || board.status !== "playing" || board.matchId == null) return;
+    const matchId = board.matchId;
+    pushHistory();
+    setBracketWinners((prev) => ({ ...prev, [matchId]: which }));
+    setTriplaBoards((prev) => prev.map((b) => (b.id === boardId ? { ...b, status: "free", matchId: null, p1Name: null, p2Name: null } : b)));
+    setTriplaTick((t) => t + 1);
+  };
+
+  // REM: Tablettikirjaus: ottelut tauluille, tulokset kaavioon - ohjelman tekijä: Johannes Ketola
+  useEffect(() => { try { localStorage.setItem(KIRJAUS_KEY, JSON.stringify(kirjaus)); } catch (e) {} }, [kirjaus]);
+  useEffect(() => { try { localStorage.setItem(PILVI_KEY, JSON.stringify(pilvi)); } catch (e) {} }, [pilvi]);
+  // triplacup-palvelin käytettävissä? (vain kun sivu on avattu palvelimelta)
+  useEffect(() => {
+    if (!onLocalServer()) return;
+    fetch("/api/info", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then((i) => { if (i && i.port) setSrvInfo(i); }).catch(() => {});
+  }, []);
+  const link = useMemo(() => makeLink(pilvi, srvInfo), [pilvi.mode, pilvi.code, srvInfo]);
+  useEffect(() => { CUR_LINK = link; if (link) pushSavedSoon(); }, [link]);
+  const [srvState, srvOk] = useLinkState(link, phase === "tournament");
+  const lastAssignPush = useRef(0);
+  const assignObj = useMemo(() => {
+    const boards = {};
+    triplaBoards.forEach((b) => {
+      if (b.disabled || b.status !== "playing" || b.matchId == null) return;
+      const m = bracketMatchesById[b.matchId];
+      boards[b.id] = { key: boardKeyOf(b), matchId: b.matchId, no: b.matchId, p1: b.p1Name, p2: b.p2Name, label: m ? triplaSectionShortLabel(m) : "",
+        start: kirjaus.start, bo: boFor(kirjaus, m, bracketTotalRounds), tb: kirjaus.tb ? kirjaus.tbDarts : 0 };
+    });
+    const cfg = { start: kirjaus.start, tb: kirjaus.tb ? kirjaus.tbDarts : 0 };
+    return { cfg, boards, v: TCLink.hash(JSON.stringify({ cfg, boards })) };
+  }, [triplaBoards, kirjaus, bracketMatchesById, bracketTotalRounds]);
+  // ottelut tauluille aina, kun ne muuttuvat
+  useEffect(() => {
+    if (!link || phase !== "tournament") return;
+    lastAssignPush.current = Date.now();
+    link.assign(assignObj).catch(() => {});
+  }, [assignObj.v, link, phase]);
+  useEffect(() => {
+    if (!srvState || !link || phase !== "tournament") return;
+    // uudelleen, jos tieto on kadonnut välillä (esim. palvelin käynnistetty uudelleen)
+    if ((!srvState.assign || srvState.assign.v !== assignObj.v) && Date.now() - lastAssignPush.current > 4000) {
+      lastAssignPush.current = Date.now();
+      link.assign(assignObj).catch(() => {});
+    }
+    const results = srvState.result || {};
+    Object.keys(results).forEach((bid) => {
+      const res = results[bid];
+      const b = triplaBoards.find((x) => x.id === Number(bid));
+      if (b && b.status === "playing" && res && res.key === boardKeyOf(b) && (res.winner === 0 || res.winner === 1)) {
+        const legs = res.legs || [0, 0];
+        finishTriplaMatch(b.id, res.winner);
+        setSrvMsg(`📱 Taulu ${b.id}: ${res.winner === 0 ? b.p1Name : b.p2Name} voitti ${Math.max(legs[0] || 0, legs[1] || 0)}–${Math.min(legs[0] || 0, legs[1] || 0)}`);
+      }
+      link.ack(bid).catch(() => {});
+    });
+  }, [srvState]);
+
+  const undoTriplaBoard = (boardId) => {
+    pushHistory();
+    setTriplaBoards((prev) => prev.map((b) => (b.id === boardId ? { ...b, status: "free", matchId: null, p1Name: null, p2Name: null } : b)));
+  };
+
+  function collectTriplaDownstream(id, acc) {
+    (bracketDependents[id] || []).forEach((depId) => {
+      if (bracketWinners[depId] !== undefined) {
+        acc.push(depId);
+        collectTriplaDownstream(depId, acc);
+      }
+    });
+  }
+
+  const undoTriplaResult = (matchId) => {
+    pushHistory();
+    const downstream = [];
+    collectTriplaDownstream(matchId, downstream);
+    setBracketWinners((prev) => {
+      const next = { ...prev };
+      delete next[matchId];
+      downstream.forEach((id) => delete next[id]);
+      return next;
+    });
+  };
+
+  const toggleTriplaBoardInTournament = (id) => {
+    pushHistory();
+    setTriplaBoards((prev) => {
+      const activeCount = prev.filter((b) => !b.disabled).length;
+      const target = prev.find((b) => b.id === id);
+      if (!target.disabled && activeCount <= 1) {
+        setNotice("Vähintään yhden taulun on oltava käytössä.");
+        return prev;
+      }
+      return prev.map((b) => (b.id === id ? { ...b, disabled: !b.disabled } : b));
+    });
+  };
+
+  // Opens one of the read-only, big-screen views in a new browser tab.
+  // They share the exact same localStorage session this tab already writes
+  // to on every action, so nothing needs to be passed along - they just
+  // read that session and refresh themselves automatically.
+  //   "boards"  -> only the boards currently in play (for the screen next
+  //                to the boards themselves)
+  //   "bracket" -> only tournament progress: standings / bracket, no boards
+  const openDisplayView = (view) => {
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("view", view);
+      window.open(url.toString(), "_blank");
+    } catch (e) {
+      window.open(window.location.pathname + "?view=" + view, "_blank");
+    }
+  };
+
+  function TriplaMatchCard({ id }) {
+    return renderTriplaMatchCardPure({ id, bracketMatchesById, bracketResults, bracketTargets, triplaSearchTerm, bracketLossCount, onUndo: undoTriplaResult });
+  }
+
+  function renderTriplaSection(sec) {
+    return renderTriplaSectionPure({ sec, bracketDef, bracketMatchesById, bracketTotalRounds, bracketResults, bracketTargets, triplaSearchTerm, bracketLossCount, onUndo: undoTriplaResult, rules: kirjaus });
+  }
+
+  const selectClass =
+    "bg-[#0b1f16] border border-[#3a5c46] rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-[#e7c977] w-full";
+
+  // REM: Käyttöliittymä (JSX) alkaa - ohjelman tekijä: Johannes Ketola
+  return (
+    <div className="min-h-screen bg-[#0b1f16] text-[#f2ede1] font-sans">
+      <div className="max-w-5xl mx-auto px-5 py-8">
+        {/* REM: Ylätunniste - ohjelman tekijä: Johannes Ketola */}
+        <header className="mb-6 border-b border-[#2d4a37] pb-5">
+          <div className="flex items-baseline justify-between gap-3 flex-wrap">
+            <div className="flex items-baseline gap-3">
+              <span className="text-3xl">🎯</span>
+              <h1 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Georgia, serif" }}>
+                Triplacup
+              </h1>
+            </div>
+            {(phase === "tournament" || setupPlayers.length > 0) && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={undoLastAction}
+                  disabled={history.length === 0}
+                  className="text-xs text-[#5b9bd5] hover:text-[#7fb4e3] border border-[#2c4a63] hover:bg-[#132537] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent rounded px-2 py-1"
+                  title="Peruuta viimeisin toiminto (esim. väärä voittotulos)"
+                >
+                  ↩ Peruuta
+                </button>
+                <button
+                  onClick={() => {
+                    if (window.confirm("Aloitetaanko täysin uusi turnaus? Nykyinen tallennettu tilanne (kaavio, tulokset) poistetaan pysyvästi.")) {
+                      clearSavedSession();
+                      window.location.reload();
+                    }
+                  }}
+                  className="text-xs text-[#c98080] hover:text-[#e8a0a0] border border-[#5c2d2d] hover:bg-[#2a1414] rounded px-2 py-1"
+                >
+                  Aloita täysin uusi turnaus
+                </button>
+              </div>
+            )}
+          </div>
+          <p className="mt-1 text-sm text-[#a9c2ae]">
+            {rulesLine(kirjaus)} &middot; voittajien kaavio, kaksi häviäjien kaaviota, välierä ja finaali &middot; pelaaja putoaa vasta kolmannella häviöllä (finaali poislukien)
+          </p>
+        </header>
+
+
+        {/* REM: Asetusnäkymä - ohjelman tekijä: Johannes Ketola */}
+        {phase === "setup" && (
+          <section>
+            <h2 className="text-lg font-semibold mb-1 text-[#e7c977]">Pelaajat</h2>
+            <p className="text-xs text-[#a9c2ae] mb-4">
+              Valitse heittäjät alasvetovalikosta (aakkosjärjestyksessä etunimen mukaan). Pelaajien nimet ja taito-/nopeusarvot tallennetaan automaattisesti tälle laitteelle, joten lisätyt pelaajat löytyvät myös seuraavalla käyttökerralla.
+            </p>
+
+            <div className="flex flex-wrap items-end gap-2 mb-4 bg-[#122a1e] border border-[#2d4a37] rounded-lg p-3">
+              <div className="flex flex-col flex-1 min-w-[200px]">
+                <label className="text-[10px] text-[#7a9484] mb-1">Lisää heittäjä turnaukseen</label>
+                <select
+                  value={rosterPick}
+                  onChange={(e) => setRosterPick(e.target.value)}
+                  className="bg-[#0b1f16] border border-[#3a5c46] rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#e7c977]"
+                >
+                  <option value="">Valitse heittäjä…</option>
+                  {availableRoster.map((p) => (
+                    <option key={p.name} value={p.name}>
+                      {p.name}
+                      {p.skill && p.speed ? ` (T${p.skill} N${p.speed})` : " (ei arvoja vielä)"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <button
+                onClick={addFromRoster}
+                disabled={!rosterPick}
+                className="bg-[#e7c977] text-[#0b1f16] font-semibold rounded px-4 py-2 text-sm hover:bg-[#f0da9c] transition-colors disabled:opacity-50"
+              >
+                Lisää
+              </button>
+              <div className="flex flex-col">
+                <label className="text-[10px] text-[#7a9484] mb-1">Lisää satunnaisia heittäjiä</label>
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    min={8}
+                    max={32}
+                    value={randomPlayerCount}
+                    onChange={(e) => setRandomPlayerCount(e.target.value)}
+                    className="w-20 bg-[#0b1f16] border border-[#3a5c46] rounded px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#e7c977]"
+                  />
+                  <button
+                    onClick={addRandomPlayers}
+                    className="bg-[#3a5c46] hover:bg-[#456a52] rounded px-4 py-2 text-sm font-semibold"
+                    title="Valitsee satunnaisesti tallennetusta rekisteristä valitun määrän heittäjiä, jotka eivät vielä ole turnauksessa"
+                  >
+                    Lisää satunnaiset
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mb-4 bg-[#122a1e] border border-[#2d4a37] rounded-lg p-4">
+              <label className="text-sm font-semibold text-[#e7c977] block mb-1">Tuo kaikki pelaajat kerralla</label>
+              <p className="text-xs text-[#7a9484] mb-2">Liitä nimet yksi per rivi. Ohjelma tunnistaa nimet automaattisesti ja hakee niille tallennetut taito- ja nopeusarvot nimen perusteella.</p>
+              <textarea
+                value={bulkNames}
+                onChange={(e) => setBulkNames(e.target.value)}
+                placeholder={"Vertti Lehtovuori\nJasu Rannikko\nOtto Sjöström\n..."}
+                rows={7}
+                className="w-full bg-[#0b1f16] border border-[#3a5c46] rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#e7c977] resize-y"
+              />
+              <div className="flex items-center justify-between gap-2 mt-2 flex-wrap">
+                <span className="text-[10px] text-[#7a9484]">Duplikaatit ohitetaan. Uudet nimet lisätään ilman valmiita arvoja.</span>
+                <button
+                  onClick={importBulkPlayers}
+                  disabled={!bulkNames.trim()}
+                  className="bg-[#e7c977] text-[#0b1f16] font-semibold rounded px-4 py-2 text-sm hover:bg-[#f0da9c] transition-colors disabled:opacity-50"
+                >
+                  Tuo lista turnaukseen
+                </button>
+              </div>
+            </div>
+
+            {setupPlayers.length === 0 && (
+              <p className="text-xs text-[#5c7566] italic mb-4">
+                Ei vielä pelaajia — valitse heittäjiä yllä olevasta valikosta.
+              </p>
+            )}
+
+            <div className="grid sm:grid-cols-2 gap-2 mb-4">
+              {setupPlayers.map((p, i) => (
+                <div key={`${p.name}-${i}`} className="bg-[#122a1e] border border-[#2d4a37] rounded-lg px-3 py-2.5">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-medium">{p.name}</span>
+                    <button onClick={() => removeSetupPlayer(i)} className="text-[#c98080] hover:text-[#e8a0a0] text-xs">
+                      Poista
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-[10px] text-[#7a9484] block mb-0.5">Taito</label>
+                      <select value={p.skill} onChange={(e) => updateSetup(i, "skill", e.target.value)} className={selectClass}>
+                        <option value="">–</option>
+                        <option value="1">1 – Paras</option>
+                        <option value="2">2 – Keskitaso</option>
+                        <option value="3">3 – Heikoin</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-[#7a9484] block mb-0.5">Nopeus</label>
+                      <select value={p.speed} onChange={(e) => updateSetup(i, "speed", e.target.value)} className={selectClass}>
+                        <option value="">–</option>
+                        <option value="1">1 – Nopein</option>
+                        <option value="2">2 – Normaali</option>
+                        <option value="3">3 – Hitain</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="mt-2">
+                    <label className="text-[10px] text-[#7a9484] block mb-1">Taulurajoitteet</label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[1,2,3,4,5,6,7].map((boardId) => {
+                        const restricted = normalizeBoardRestrictions(p.boardRestrictions, p.name).includes(boardId);
+                        return (
+                          <button
+                            key={boardId}
+                            type="button"
+                            onClick={() => toggleSetupRestriction(i, boardId)}
+                            className={`w-8 h-8 rounded text-[11px] font-semibold border ${restricted ? "bg-[#7a3f3f] text-[#f2ede1] border-[#c98080]" : "bg-[#0b1f16] text-[#7a9484] border-[#3a5c46]"}`}
+                            title={restricted ? `Taulu ${boardId}: estetty` : `Taulu ${boardId}: sallittu`}
+                          >
+                            {boardId}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-[#7a9484] mt-1">Punaisena näkyvät taulut ovat pelaajalta kiellettyjä. Rajoitus voidaan tarvittaessa ohittaa pelin käynnistyksessä.</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-end gap-2 mb-5 bg-[#122a1e] border border-[#2d4a37] border-dashed rounded-lg p-3">
+              <div className="w-full text-[10px] text-[#7a9484] mb-1">Tai lisää täysin uusi heittäjä (ei vielä listalla):</div>
+              <div className="flex flex-col">
+                <label className="text-[10px] text-[#7a9484] mb-1">Nimi</label>
+                <input
+                  value={newSetupName}
+                  onChange={(e) => setNewSetupName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && addSetupPlayer()}
+                  placeholder="Nimi"
+                  className="bg-[#0b1f16] border border-[#3a5c46] rounded px-3 py-2 text-sm w-44 focus:outline-none focus:ring-2 focus:ring-[#e7c977]"
+                />
+              </div>
+              <div className="flex flex-col">
+                <label className="text-[10px] text-[#7a9484] mb-1">Taito</label>
+                <select value={newSetupSkill} onChange={(e) => setNewSetupSkill(e.target.value)} className={`${selectClass} w-32`}>
+                  <option value="">–</option>
+                  <option value="1">1 – Paras</option>
+                  <option value="2">2 – Keskitaso</option>
+                  <option value="3">3 – Heikoin</option>
+                </select>
+              </div>
+              <div className="flex flex-col">
+                <label className="text-[10px] text-[#7a9484] mb-1">Nopeus</label>
+                <select value={newSetupSpeed} onChange={(e) => setNewSetupSpeed(e.target.value)} className={`${selectClass} w-32`}>
+                  <option value="">–</option>
+                  <option value="1">1 – Nopein</option>
+                  <option value="2">2 – Normaali</option>
+                  <option value="3">3 – Hitain</option>
+                </select>
+              </div>
+              <button onClick={addSetupPlayer} className="bg-[#3a5c46] hover:bg-[#456a52] rounded px-4 py-2 text-sm font-medium">
+                Lisää pelaaja
+              </button>
+            </div>
+
+            <div className="mb-5 bg-[#122a1e] border border-[#2d4a37] rounded-lg p-4">
+              <label className="text-sm font-semibold text-[#e7c977] block mb-2">Kaavion koko</label>
+              <div className="flex gap-2 mb-2">
+                {[16, 32].map((sz) => (
+                  <button
+                    key={sz}
+                    onClick={() => setBracketSize(sz)}
+                    className={`px-4 py-2 rounded text-sm font-medium border ${
+                      bracketSize === sz ? "bg-[#e7c977] text-[#0b1f16] border-[#e7c977]" : "bg-[#0b1f16] text-[#f2ede1] border-[#3a5c46] hover:border-[#e7c977]"
+                    }`}
+                  >
+                    {sz} paikkaa
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-[#7a9484] mb-2">
+                Osallistujia voi olla {bracketSize / 2}–{bracketSize}. Jos pelaajia on vähemmän kuin {bracketSize}, ylimääräiset paikat jaetaan vapaapareina kierrokselle 1 — nämä pelaajat etenevät automaattisesti ilman vastustajaa, eikä kaksi vapaaparia voi koskaan osua samaan otteluun.
+              </p>
+              <label className="flex items-center gap-2 text-xs text-[#a9c2ae]">
+                <input type="checkbox" checked={triplaRandomDraw} onChange={(e) => setTriplaRandomDraw(e.target.checked)} />
+                Arvo ensimmäisen kierroksen parit täysin satunnaisesti (suositus — jätä valittuna, ellet halua asettaa pelaajalistan järjestystä lähtöpaikoiksi itse)
+              </label>
+              <p className="text-xs text-[#7a9484] mt-1">{setupPlayers.length} pelaajaa juuri nyt.</p>
+            </div>
+
+            <div className="mb-5 bg-[#122a1e] border border-[#2d4a37] rounded-lg p-4">
+              <label className="text-base font-semibold text-[#e7c977] block mb-3">Ottelusäännöt</label>
+              <RulesEditor rules={kirjaus} setRules={setKirjaus} size={bracketSize} />
+            </div>
+
+            <div className="mb-5 bg-[#122a1e] border border-[#2d4a37] rounded-lg p-4">
+              <label className="text-sm font-semibold text-[#e7c977] block mb-2">Käytössä olevat taulut</label>
+              <p className="text-xs text-[#7a9484] mb-2">
+                Taulut on numeroitu kiinteästi seinälle — valitse mitkä ovat käytössä. Minimissään 2.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {[1, 2, 3, 4, 5, 6, 7].map((num) => {
+                  const active = activeBoardNumbers.has(num);
+                  return (
+                    <button
+                      key={num}
+                      onClick={() => toggleSetupBoard(num)}
+                      className={`w-11 h-11 rounded text-sm font-semibold border ${
+                        active
+                          ? "bg-[#e7c977] text-[#0b1f16] border-[#e7c977]"
+                          : "bg-[#0b1f16] text-[#5c7566] border-[#3a5c46] line-through"
+                      }`}
+                    >
+                      {num}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-[#7a9484] mt-2">{activeBoardNumbers.size} taulua käytössä.</p>
+            </div>
+
+            {notice && <p className="text-sm text-[#e8a0a0] mb-3">{notice}</p>}
+
+            <button
+              onClick={startTriplacup}
+              disabled={computing}
+              className="bg-[#e7c977] text-[#0b1f16] font-semibold rounded px-5 py-2.5 text-sm hover:bg-[#f0da9c] transition-colors disabled:opacity-50"
+            >
+              {computing ? "Lasketaan…" : "Aloita turnaus →"}
+            </button>
+          </section>
+        )}
+
+        {/* REM: Turnausnäkymä - ohjelman tekijä: Johannes Ketola */}
+        {phase === "tournament" && (
+          <section>
+            {/* REM: Triplacup-turnausnäkymä - ohjelman tekijä: Johannes Ketola */}
+            <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+              <div>
+                <h2 className="text-lg font-semibold text-[#e7c977]">Triplacup — {bracketSize} paikkaa</h2>
+                <p className="text-xs text-[#a9c2ae] mt-1">
+                  {bracketDef.filter((m) => bracketResults[m.id] && bracketResults[m.id].decided && !bracketResults[m.id].isBye).length}/
+                  {bracketDef.filter((m) => bracketResults[m.id] && !bracketResults[m.id].isBye).length} ottelua ratkaistu
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={() => openDisplayView("boards")}
+                  className="bg-transparent border border-[#e7c977] text-[#e7c977] hover:bg-[#1c1808] rounded px-4 py-2 text-sm font-medium"
+                >
+                  📺 Taulut-näyttö
+                </button>
+                <button
+                  onClick={() => openDisplayView("bracket")}
+                  className="bg-transparent border border-[#e7c977] text-[#e7c977] hover:bg-[#1c1808] rounded px-4 py-2 text-sm font-medium"
+                >
+                  📺 Kaavio-näyttö
+                </button>
+                <input
+                  value={triplaSearchTerm}
+                  onChange={(e) => setTriplaSearchTerm(e.target.value)}
+                  placeholder="🔍 Etsi pelaaja…"
+                  className="bg-[#0b1f16] border border-[#3a5c46] rounded px-3 py-2 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-[#e7c977]"
+                />
+              </div>
+            </div>
+
+            {notice && (
+              <div className="mb-4 text-sm text-[#e8a0a0] bg-[#2a1414] border border-[#5c2d2d] rounded px-3 py-2">{notice}</div>
+            )}
+
+            {triplaChampionResult && triplaChampionResult.decided && (
+              <div className="max-w-lg mx-auto mb-6 text-center bg-gradient-to-br from-[#2a2410] to-[#1b3327] border border-[#e7c977] rounded-lg p-5">
+                <div className="text-[#e7c977] text-xs uppercase tracking-widest">Turnauksen mestari</div>
+                <div className="text-2xl font-bold mt-1" style={{ fontFamily: "Georgia, serif" }}>🏆 {triplaChampionResult.winnerName}</div>
+              </div>
+            )}
+
+            {triplaStandings.length > 0 && (
+              <div className="max-w-md mx-auto mb-6 bg-[#122a1e] border border-[#2d4a37] rounded-lg p-4">
+                <h3 className="text-sm font-semibold text-[#e7c977] mb-3 text-center">Lopputulokset</h3>
+                <ol className="text-sm space-y-1">
+                  {triplaStandings.map((row, i) => (
+                    <li key={i} className="flex gap-3">
+                      <span className="text-[#e7c977] font-semibold w-14 shrink-0 text-right">{row.rankLabel}</span>
+                      <span>{row.name}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+
+            <details className="mb-4 bg-[#122a1e] border border-[#2d4a37] rounded-lg">
+              <summary className="cursor-pointer select-none px-3 py-2.5 text-sm font-semibold text-[#e7c977]">⚙ Ottelusäännöt <span className="font-normal text-xs text-[#a9c2ae] ml-2">{rulesLine(kirjaus)} · muuta tästä</span></summary>
+              <div className="px-3 pb-3"><RulesEditor rules={kirjaus} setRules={setKirjaus} size={bracketSize} bracketDef={bracketDef} bracketTotalRounds={bracketTotalRounds} running /></div>
+            </details>
+            <TabletPanel link={link} srvOk={srvOk} srvInfo={srvInfo} pilvi={pilvi} setPilvi={setPilvi} kirjaus={kirjaus} setKirjaus={setKirjaus} srvMsg={srvMsg} />
+
+            <h3 className="text-sm font-semibold text-[#e7c977] mb-2">Taulut</h3>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-6">
+              {triplaBoards.map((b) => (
+                <div
+                  key={b.id}
+                  className={`rounded-lg p-4 border ${
+                    b.disabled
+                      ? "bg-[#1a1a1a] border-[#3a3a3a] opacity-60"
+                      : b.status === "playing"
+                      ? "bg-[#122a1e] border-[#e7c977]/40"
+                      : "bg-[#0f2419] border-[#2d4a37] border-dashed"
+                  }`}
+                >
+                  <div className="text-xs text-[#a9c2ae] mb-2 flex items-center justify-between">
+                    <span>Taulu {b.id}</span>
+                    <span>{b.disabled ? "Pois käytöstä" : b.status === "playing" ? "Käynnissä" : "Vapaa"}</span>
+                  </div>
+                  {b.status === "playing" ? (
+                    <div>
+                      {(() => {
+                        const m = bracketMatchesById[b.matchId];
+                        return m ? (
+                          <span className={`inline-block text-[10px] rounded px-1.5 py-0.5 mb-2 ${triplaSectionBadgeClass(m.sec)}`}>
+                            {triplaSectionShortLabel(m)}
+                          </span>
+                        ) : null;
+                      })()}
+                      <div className="text-sm font-medium mb-1">{b.p1Name}</div>
+                      <div className="text-center text-[#a9c2ae] text-xs my-1">vs</div>
+                      <div className="text-sm font-medium mb-3">{b.p2Name}</div>
+                      <div className="text-[11px] text-[#a9c2ae] -mt-2 mb-2">{kirjaus.start} · {boTxt(boFor(kirjaus, bracketMatchesById[b.matchId], bracketTotalRounds), true)}{kirjaus.tb ? ` · TB ${kirjaus.tbDarts}` : ""}</div>
+                      {link && <TabletLive live={liveForBoard(srvState, b)} />}
+                      <div className="grid grid-cols-1 gap-2 mb-2">
+                        <button onClick={() => finishTriplaMatch(b.id, 0)} className="bg-[#3a5c46] hover:bg-[#456a52] rounded px-2 py-1.5 text-xs font-medium">
+                          {b.p1Name} voitti
+                        </button>
+                        <button onClick={() => finishTriplaMatch(b.id, 1)} className="bg-[#3a5c46] hover:bg-[#456a52] rounded px-2 py-1.5 text-xs font-medium">
+                          {b.p2Name} voitti
+                        </button>
+                      </div>
+                      <button
+                        onClick={() => undoTriplaBoard(b.id)}
+                        className="w-full bg-transparent border border-[#5b9bd5] text-[#5b9bd5] hover:bg-[#132537] rounded px-2 py-1 text-xs font-medium"
+                      >
+                        Peruuta — vapauta taulu
+                      </button>
+                    </div>
+                  ) : (
+                    <div>
+                      {b.disabled ? (
+                        <div className="text-sm text-[#5c7566] italic mb-2">Ei käytössä</div>
+                      ) : (
+                        <>
+                          {triplaBoardAssign[b.id] && (() => {
+                            const m = bracketMatchesById[Number(triplaBoardAssign[b.id])];
+                            return m ? (
+                              <span className={`inline-block text-[10px] rounded px-1.5 py-0.5 mb-1 ${triplaSectionBadgeClass(m.sec)}`}>
+                                Ehdotus: {triplaSectionShortLabel(m)}
+                              </span>
+                            ) : null;
+                          })()}
+                          <select
+                            value={triplaBoardAssign[b.id] || ""}
+                            onChange={(e) => setTriplaBoardAssign((prev) => ({ ...prev, [b.id]: e.target.value }))}
+                            className="w-full bg-[#0b1f16] border border-[#3a5c46] rounded px-2 py-1.5 text-xs mb-2"
+                          >
+                            <option value="">Valitse pelattava ottelu…</option>
+                            {triplaReadyMatchIds
+                              .filter((id) => {
+                                const r = bracketResults[id];
+                                const pendingElsewhere = Object.entries(triplaBoardAssign).some(
+                                  ([bId, v]) => Number(bId) !== b.id && v && Number(v) === id
+                                );
+                                return !pendingElsewhere && !triplaBoardRestricted(r.p1.name, b.id) && !triplaBoardRestricted(r.p2.name, b.id);
+                              })
+                              .map((id) => {
+                                const r = bracketResults[id];
+                                const m = bracketMatchesById[id];
+                                return (
+                                  <option key={id} value={id}>
+                                    [{triplaSectionShortLabel(m)}] {r.p1.name} vs {r.p2.name} (Ottelu {id})
+                                  </option>
+                                );
+                              })}
+                          </select>
+                          <div className="grid grid-cols-2 gap-2 mb-2">
+                            <button
+                              onClick={() => suggestTriplaMatchForBoard(b.id)}
+                              className="w-full bg-transparent border border-[#e7c977] text-[#e7c977] hover:bg-[#1c1808] rounded px-2 py-1.5 text-xs font-medium"
+                            >
+                              🎯 Ehdota ottelua
+                            </button>
+                            <button
+                              onClick={() => triplaBoardAssign[b.id] && assignTriplaMatch(b.id, Number(triplaBoardAssign[b.id]))}
+                              disabled={!triplaBoardAssign[b.id]}
+                              className="w-full bg-[#e7c977] text-[#0b1f16] font-semibold rounded px-2 py-1.5 text-xs hover:bg-[#f0da9c] disabled:opacity-50"
+                            >
+                              Aloita
+                            </button>
+                          </div>
+                        </>
+                      )}
+                      <button
+                        onClick={() => toggleTriplaBoardInTournament(b.id)}
+                        className="w-full bg-transparent border border-[#3a5c46] text-[#a9c2ae] hover:bg-[#0f2419] rounded px-2 py-1 text-xs font-medium"
+                      >
+                        {b.disabled ? "Ota taulu käyttöön" : "Poista taulu käytöstä"}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div className="mb-6 bg-[#122a1e] border border-[#e7c977]/50 rounded-lg p-4">
+              <h3 className="text-sm font-semibold text-[#e7c977] mb-2">📺 Pelattavissa nyt ({triplaReadyMatchIds.length})</h3>
+              {triplaReadyMatchIds.length === 0 ? (
+                <p className="text-xs text-[#7a9484] italic">
+                  {triplaChampionResult && triplaChampionResult.decided ? "Turnaus on päättynyt." : "Ei juuri nyt pelattavia otteluita — odottaa aiempien tulosten valmistumista."}
+                </p>
+              ) : (
+                <div className="flex gap-2.5 flex-wrap">
+                  {triplaReadyMatchIds.map((id) => <TriplaMatchCard key={id} id={id} />)}
+                </div>
+              )}
+            </div>
+
+            <div className="mb-6 bg-[#1c1808] border border-[#e7c977]/60 rounded-lg p-4 text-center">
+              <p className="text-sm text-[#a9c2ae] mb-3">
+                Koko kaavio, välierä/finaali ja lopputulokset kannattaa pitää omalla sivulla, jonka voi jättää auki isolle näytölle — se päivittyy automaattisesti, kun täällä käynnistät ja kirjaat otteluita.
+              </p>
+              <button
+                onClick={() => openDisplayView("bracket")}
+                className="bg-[#e7c977] text-[#0b1f16] font-semibold rounded px-5 py-2.5 text-sm hover:bg-[#f0da9c]"
+              >
+                📺 Avaa kaavio-näyttö uuteen välilehteen
+              </button>
+            </div>
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// REM: Näyttönäkymät (isolle näytölle avattavat, reaaliaikaiset, ei-
+// interaktiiviset näkymät) - ohjelman tekijä: Johannes Ketola
+//
+// Nämä eivät jaa React-tilaa hallintanäkymän kanssa - ne lukevat samaa
+// localStorage-istuntoa, jota hallintanäkymä joka tapauksessa jo kirjoittaa
+// joka klikkauksella, ja päivittyvät automaattisesti kun se muuttuu
+// (storage-eventti muista välilehdistä + lyhyt varmuuden vuoksi tehtävä
+// pollaus). Kaksi erillistä näkymää, eri välilehdille / eri näytöille:
+//   "boards"  -> vain se, mitä tauluilla pelataan juuri nyt
+//   "bracket" -> vain turnauksen eteneminen: tulostaulu / kaavio, ei tauluja
+const DISPLAY_ZOOM_KEY = "triplacup-display-zoom-v1";
+
+// REM: Näyttönäkymän oma zoom - ohjelman tekijä: Johannes Ketola
+// The browser's own zoom is saved per SITE, not per tab, so Ctrl+/Ctrl- on
+// the control tab also resizes this tab, and vice versa - a web page
+// cannot turn that off. Instead of fighting it, this MEASURES it (browser
+// zoom changes window.devicePixelRatio) and CANCELS it with an equal and
+// opposite CSS zoom on this tab's own content, then layers this tab's own
+// desired zoom on top of that. `refDpr` is the baseline captured the
+// moment this tab opened; `comp` is recomputed on resize and on a short
+// poll (resize doesn't fire reliably for every zoom path in every
+// browser), so this stays correct even if the other tab is zoomed later.
+function DisplayView({ view }) {
+  const remoteCode = useMemo(() => { const k = new URLSearchParams(window.location.search).get("k"); return TCLink.validCode(k) ? k : null; }, []);
+  const [session, setSession] = useState(() => (remoteCode ? null : loadSavedSession()));
+  const [remote, setRemote] = useState({ state: null, ok: false, got: false });
+  useEffect(() => {
+    if (!remoteCode) return undefined;
+    return TCLink.cloud(PILVI_DB, remoteCode).watchAll(
+      (all) => { setRemote((r) => ({ ...r, state: all.state, got: true })); setSession(all.saved && all.saved.session ? all.saved.session : null); },
+      (ok) => setRemote((r) => (r.ok === ok ? r : { ...r, ok }))
+    );
+  }, [remoteCode]);
+  const localLink = useMemo(() => (remoteCode ? null : makeLink(loadPilvi(), onLocalServer() ? {} : null)), [remoteCode]);
+  const [localState] = useLinkState(localLink, view === "boards");
+  const srvState = remoteCode ? remote.state : localState;
+  const [zoom, setZoom] = useState(() => {
+    try {
+      const v = parseFloat(localStorage.getItem(DISPLAY_ZOOM_KEY));
+      return v >= 0.5 && v <= 3 ? v : 1;
+    } catch (e) { return 1; }
+  });
+  const [refDpr] = useState(() => window.devicePixelRatio || 1);
+  const [comp, setComp] = useState(1);
+
+  useEffect(() => {
+    if (remoteCode) return undefined;
+    function refresh() { setSession(loadSavedSession()); }
+    window.addEventListener("storage", refresh);
+    const interval = setInterval(refresh, 1500);
+    return () => {
+      window.removeEventListener("storage", refresh);
+      clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    function updateComp() { setComp(refDpr / (window.devicePixelRatio || 1)); }
+    updateComp();
+    window.addEventListener("resize", updateComp);
+    const interval = setInterval(updateComp, 700);
+    return () => {
+      window.removeEventListener("resize", updateComp);
+      clearInterval(interval);
+    };
+  }, [refDpr]);
+
+  useEffect(() => {
+    try { localStorage.setItem(DISPLAY_ZOOM_KEY, String(zoom)); } catch (e) {}
+  }, [zoom]);
+
+  useEffect(() => {
+    function clampZoom(z) { return Math.max(0.5, Math.min(3, Math.round(z * 100) / 100)); }
+    function onKey(e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "+" || e.key === "=") { e.preventDefault(); setZoom((z) => clampZoom(z + 0.1)); }
+      else if (e.key === "-" || e.key === "_") { e.preventDefault(); setZoom((z) => clampZoom(z - 0.1)); }
+      else if (e.key === "0") { e.preventDefault(); setZoom(1); }
+    }
+    function onWheel(e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      setZoom((z) => clampZoom(z + (e.deltaY < 0 ? 0.1 : -0.1)));
+    }
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("wheel", onWheel);
+    };
+  }, []);
+
+  const zoomBar = (
+    <div
+      className="fixed bottom-2 left-4 flex items-center gap-2 text-[13px] text-[#a9c2ae] opacity-30 hover:opacity-100 transition-opacity z-50"
+      style={{ zoom: String(comp) }}
+    >
+      <button
+        onClick={() => setZoom((z) => Math.max(0.5, Math.round((z - 0.1) * 100) / 100))}
+        className="bg-[#132a1e] text-[#e7c977] border border-[#2d4a37] rounded px-2 py-0.5"
+        title="Pienennä (CTRL -)"
+      >
+        A−
+      </button>
+      <span>{Math.round(zoom * 100)}%</span>
+      <button
+        onClick={() => setZoom((z) => Math.min(3, Math.round((z + 0.1) * 100) / 100))}
+        className="bg-[#132a1e] text-[#e7c977] border border-[#2d4a37] rounded px-2 py-0.5"
+        title="Suurenna (CTRL +)"
+      >
+        A+
+      </button>
+    </div>
+  );
+
+  const effectiveZoom = zoom * comp;
+
+  if (!session || !session.phase || session.phase !== "tournament") {
+    return (
+      <>
+        <div className="min-h-screen bg-[#0b1f16] text-[#f2ede1] font-sans flex items-center justify-center px-6" style={{ zoom: String(effectiveZoom) }}>
+          <p className="text-xl text-[#a9c2ae] text-center">
+            {!remoteCode ? "Odotetaan turnauksen käynnistystä toisessa välilehdessä…"
+              : !remote.got ? (remote.ok ? "Yhdistetään…" : "Yhdistetään… (tarkista nettiyhteys)")
+              : "Odotetaan turnauksen käynnistystä…"}
+          </p>
+        </div>
+        {zoomBar}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div style={{ zoom: String(effectiveZoom) }}>
+        {view === "boards" ? <TriplaBoardsDisplay session={session} srvState={srvState} /> : <TriplaBracketDisplay session={session} />}
+      </div>
+      {zoomBar}
+    </>
+  );
+}
+
+function DisplayHeader({ title }) {
+  return (
+    <header className="mb-6 border-b border-[#2d4a37] pb-4 flex items-baseline justify-between flex-wrap gap-2">
+      <h1 className="text-2xl font-bold text-[#e7c977]" style={{ fontFamily: "Georgia, serif" }}>{title}</h1>
+      <span className="text-xs text-[#5c7566]">Päivittyy automaattisesti</span>
+    </header>
+  );
+}
+
+function TriplaBoardsDisplay({ session, srvState }) {
+  const bracketDef = session.bracketDef || [];
+  const bracketMatchesById = {};
+  bracketDef.forEach((m) => (bracketMatchesById[m.id] = m));
+  const triplaBoards = session.triplaBoards || [];
+
+  return (
+    <div className="min-h-screen bg-[#0b1f16] text-[#f2ede1] font-sans">
+      <div className="max-w-6xl mx-auto px-6 py-8">
+        <DisplayHeader title="🎯 Taulut" />
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {triplaBoards.map((b) => {
+            const m = b.matchId != null ? bracketMatchesById[b.matchId] : null;
+            return (
+              <div
+                key={b.id}
+                className={`rounded-lg p-5 border ${
+                  b.disabled ? "bg-[#1a1a1a] border-[#3a3a3a] opacity-50" : b.status === "playing" ? "bg-[#122a1e] border-[#e7c977]/40" : "bg-[#0f2419] border-[#2d4a37] border-dashed"
+                }`}
+              >
+                <div className="text-sm text-[#a9c2ae] mb-3 flex items-center justify-between">
+                  <span>Taulu {b.id}</span>
+                  <span>{b.disabled ? "Pois käytöstä" : b.status === "playing" ? "Käynnissä" : "Vapaa"}</span>
+                </div>
+                {b.status === "playing" ? (
+                  <>
+                    {m && (
+                      <span className={`inline-block text-xs rounded px-2 py-1 mb-3 ${triplaSectionBadgeClass(m.sec)}`}>
+                        {triplaSectionShortLabel(m)}
+                      </span>
+                    )}
+                    <div className="text-xl font-semibold">{b.p1Name}</div>
+                    <div className="text-center text-[#a9c2ae] text-sm my-1.5">vs</div>
+                    <div className="text-xl font-semibold">{b.p2Name}</div>
+                    {liveForBoard(srvState, b) && <div className="mt-3"><TabletLive live={liveForBoard(srvState, b)} big /></div>}
+                  </>
+                ) : (
+                  <div className="text-base text-[#5c7566] italic">{b.disabled ? "" : "vapaa"}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Compact, read-only match chip for the big-screen bracket display. Shows
+// the match number and — just like the hand-drawn reference bracket — a
+// tiny "V→" (voitto, where the winner goes) / "H→" (häviö, where the loser
+// goes) line, so a player can trace their own path forward without any
+// explanation from the organizer. Still small enough that a full round-1
+// column (up to 16 matches for a 32-bracket) fits a landscape TV's height.
+function renderTriplaCompactCard({ id, bracketMatchesById, bracketResults, bracketTargets, large }) {
+  const m = bracketMatchesById[id];
+  const r = bracketResults[id];
+  if (!m || !r) return null;
+  const secBorder = { WB: "border-l-[#3e8e5b]", LB1: "border-l-[#d38a3f]", LB2: "border-l-[#c0392b]", SF: "border-l-[#e7c977]", F: "border-l-[#e7c977]" }[m.sec];
+  const winTarget = bracketTargets.winnerTargetOf[id];
+  // The generic winner/loser map doesn't cover the SF match's conditional
+  // rematch (a separate "loserIfSlot" source type), so it's filled in by
+  // hand here: losing the SF match sends the winners'-bracket-side player
+  // to the rematch at `winTarget` - the only case where losing doesn't
+  // immediately end the run. Every other match either has a real
+  // loserTargetOf entry (WB/LB1 losers keep going) or none at all (LB2
+  // losers and the two finalists are simply done) - and when there is
+  // none, we show nothing rather than any "you're out" text.
+  const isSfMatch = m.sec === "SF" && m.roundIndex === 1;
+  const loseTarget = isSfMatch ? winTarget : bracketTargets.loserTargetOf[id];
+
+  const nameRow = (name, isWinner, pending) => (
+    <div className={`truncate leading-tight ${r.decided ? (isWinner ? "text-[#e7c977] font-semibold" : "text-[#5c7566] line-through") : "text-[#f2ede1]"}`}>
+      {pending ? "…" : name === null ? "—" : name}
+    </div>
+  );
+
+  const numberBadge = (
+    <div className={`flex items-center justify-center font-semibold text-[#e7c977] shrink-0 border-r border-[#264536] ${large ? "text-[24px] pr-3 mr-3 min-w-[33px]" : "text-[11px] pr-1.5 mr-1.5 min-w-[16px]"}`}>
+      {id})
+    </div>
+  );
+  // Right-hand routing badge: "V24" = winner goes to match 24, "H66" =
+  // loser goes to match 66. Either line is left out when it doesn't exist
+  // (LB2 losers are simply out, the final has no next match), so LB2 cards
+  // only show the V line.
+  const hasRoute = winTarget != null || loseTarget != null;
+  const boxWidth = large
+    ? (hasRoute ? "min-w-[280px] max-w-[395px]" : "min-w-[225px] max-w-[340px]")
+    : (hasRoute ? "min-w-[125px] max-w-[175px]" : "min-w-[100px] max-w-[150px]");
+  const loseBadge = hasRoute ? (
+    <div className={`flex flex-col items-start justify-center leading-tight text-[#8fa396] shrink-0 border-l border-[#264536] whitespace-nowrap ${large ? "text-[20px] pl-3 ml-3" : "text-[10px] pl-1.5 ml-1.5"}`}>
+      {winTarget != null && <div>V{winTarget}</div>}
+      {loseTarget != null && <div>H{loseTarget}</div>}
+    </div>
+  ) : null;
+
+  const boxPad = large ? "px-4 py-3" : "px-1.5 py-1";
+  const boxText = large ? "text-[23px]" : "text-[11px]";
+  const boxBorder = large ? "border-l-[6px]" : "border-l-[3px]";
+  const vapaaText = large ? "text-[15px]" : "text-[8px]";
+
+  if (r.isBye) {
+    return (
+      <div key={id} className={`bg-[#152a20] border border-[#264536] ${secBorder} ${boxBorder} rounded flex items-center ${boxPad} ${boxText} ${boxWidth}`}>
+        {numberBadge}
+        <div className="flex-1 min-w-0">
+          <div className="text-[#e7c977] font-semibold truncate leading-tight">{r.winnerName}</div>
+          <div className={`${vapaaText} text-[#5c7566] leading-tight`}>vapaapari</div>
+        </div>
+        {loseBadge}
+      </div>
+    );
+  }
+  return (
+    <div key={id} className={`bg-[#152a20] border border-[#264536] ${secBorder} ${boxBorder} rounded flex items-center ${boxPad} ${boxText} ${boxWidth}`}>
+      {numberBadge}
+      <div className="flex-1 min-w-0">
+        {nameRow(r.p1.name, r.winnerName === r.p1.name, r.p1.pending)}
+        {nameRow(r.p2.name, r.winnerName === r.p2.name, r.p2.pending)}
+      </div>
+      {loseBadge}
+    </div>
+  );
+}
+
+// One bracket section (WB/LB1/LB2/SF/F) laid out as a real bracket tree
+// reads left-to-right, not top-to-bottom: each round is a column, and a
+// later round's (fewer) matches are vertically centered against the
+// earlier round's matches that feed them. This is what actually lets a
+// whole section fit a landscape screen's height - the column that needs
+// the most vertical room is round 1's, everything after it only gets
+// narrower going down, never adds height.
+function renderTriplaHorizontalSection({ sec, bracketDef, bracketMatchesById, bracketResults, bracketTargets, large }) {
+  const ids = bracketDef.filter((m) => m.sec === sec).map((m) => m.id);
+  if (ids.length === 0) return null;
+  const rounds = {};
+  ids.forEach((id) => {
+    const m = bracketMatchesById[id];
+    (rounds[m.roundIndex] = rounds[m.roundIndex] || []).push(id);
+  });
+  const allRoundKeys = Object.keys(rounds).map(Number).sort((a, b) => a - b);
+  // In the 2nd-loss bracket the last rounds are single matches, one per
+  // round, which made the bracket needlessly wide. Those trailing
+  // one-match rounds are stacked on top of each other in ONE column instead
+  // (with clear spacing so they don't touch).
+  let stackKeys = [];
+  if (sec === "LB2") {
+    for (let i = allRoundKeys.length - 1; i >= 0 && rounds[allRoundKeys[i]].length === 1; i--) stackKeys.unshift(allRoundKeys[i]);
+    if (stackKeys.length < 2) stackKeys = [];
+  }
+  const roundKeys = allRoundKeys.filter((k) => !stackKeys.includes(k));
+  return (
+    <div key={sec} className="flex gap-3 h-full items-stretch">
+      {roundKeys.map((rIdx) => (
+        <div key={rIdx} className="flex flex-col justify-center gap-1.5 min-w-0">
+          <div className={`font-semibold text-[#e7c977] text-center uppercase tracking-wide ${large ? "text-[17px] mb-1.5" : "text-[10px] mb-0.5"}`}>
+            {sec === "F" ? "Loppuottelu" : sec === "SF" ? (rIdx === 1 ? "Välierä" : "Uusinta") : `Kierros ${rIdx}`}
+          </div>
+          {/* A round with more than 8 matches (round 1 of a 32-bracket has 16)
+              is split into side-by-side sub-columns of at most 8, so it uses
+              the screen's spare width instead of overflowing its height. */}
+          <div className="flex gap-2 flex-1 items-stretch">
+            {chunkIntoColumns(rounds[rIdx], Math.ceil(rounds[rIdx].length / 8)).map((chunk, ci) => (
+              <div key={ci} className={`flex flex-col justify-center flex-1 ${large ? "gap-4" : "gap-1.5"}`}>
+                {chunk.map((id) => renderTriplaCompactCard({ id, bracketMatchesById, bracketResults, bracketTargets, large }))}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {stackKeys.length > 0 && (
+        <div className="flex flex-col justify-center gap-1.5 min-w-0">
+          <div className={`font-semibold text-[#e7c977] text-center uppercase tracking-wide ${large ? "text-[17px] mb-1.5" : "text-[10px] mb-0.5"}`}>
+            Kierros {stackKeys[0]}–{stackKeys[stackKeys.length - 1]}
+          </div>
+          <div className="flex flex-col justify-center gap-5 flex-1">
+            {stackKeys.map((k) => renderTriplaCompactCard({ id: rounds[k][0], bracketMatchesById, bracketResults, bracketTargets, large }))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function chunkIntoColumns(arr, colCount) {
+  const perCol = Math.ceil(arr.length / colCount);
+  const cols = [];
+  for (let i = 0; i < colCount; i++) cols.push(arr.slice(i * perCol, (i + 1) * perCol));
+  return cols.filter((c) => c.length > 0);
+}
+
+const TRIPLA_SEC_TITLE = { WB: "🏆 Voittajien kaavio", LB1: "1️⃣ Kerran hävinneiden kaavio", LB2: "2️⃣ Kahdesti hävinneiden kaavio" };
+
+function TriplaBracketDisplay({ session }) {
+  const bracketDef = session.bracketDef || [];
+  const bracketWinners = session.bracketWinners || {};
+  const bracketSeeds = session.bracketSeeds || [];
+  const bracketFinalId = session.bracketFinalId || null;
+
+  const { bracketMatchesById, bracketResults, bracketTargets } = deriveTriplaBracketState(bracketDef, bracketWinners, bracketSeeds);
+  const championResult = bracketFinalId ? bracketResults[bracketFinalId] : null;
+  const isFinished = !!(championResult && championResult.decided);
+  const standings = computeTriplaStandingsPure(bracketDef, bracketResults, bracketFinalId);
+
+  // Pages rotate automatically (no controls - this is a passive screen):
+  // finale first, then each bracket that actually has matches yet. A
+  // section with zero real matches (can happen briefly right after start
+  // with a tiny field) is simply skipped rather than shown empty.
+  const pages = ["final", ...["WB", "LB1", "LB2"].filter((sec) => bracketDef.some((m) => m.sec === sec))];
+  const [pageIndex, setPageIndex] = useState(0);
+
+  useEffect(() => {
+    if (isFinished || pages.length <= 1) return;
+    const interval = setInterval(() => {
+      setPageIndex((i) => (i + 1) % pages.length);
+    }, 9000);
+    return () => clearInterval(interval);
+  }, [isFinished, pages.length]);
+
+  if (isFinished) {
+    const cols = chunkIntoColumns(standings, standings.length > 24 ? 4 : standings.length > 10 ? 3 : standings.length > 4 ? 2 : 1);
+    return (
+      <div className="bg-[#0b1f16] text-[#f2ede1] font-sans flex flex-col" style={{ height: "100vh" }}>
+        <div className="flex-1 min-h-0 flex flex-col items-center justify-center px-8 py-6 gap-6">
+          <div className="text-center bg-gradient-to-br from-[#2a2410] to-[#1b3327] border border-[#e7c977] rounded-lg px-10 py-5">
+            <div className="text-[#e7c977] text-sm uppercase tracking-widest">Turnauksen mestari</div>
+            <div className="text-4xl font-bold mt-1" style={{ fontFamily: "Georgia, serif" }}>🏆 {championResult.winnerName}</div>
+          </div>
+          {standings.length > 0 && (
+            <div className="flex gap-10 bg-[#122a1e] border border-[#2d4a37] rounded-lg px-8 py-5">
+              {cols.map((col, ci) => (
+                <ol key={ci} className="text-base space-y-1">
+                  {col.map((row, i) => (
+                    <li key={i} className="flex gap-3">
+                      <span className="text-[#e7c977] font-semibold w-16 shrink-0 text-right">{row.rankLabel}</span>
+                      <span className="whitespace-nowrap">{row.name}</span>
+                    </li>
+                  ))}
+                </ol>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const page = pages[pageIndex] || "final";
+
+  return (
+    <div className="bg-[#0b1f16] text-[#f2ede1] font-sans flex flex-col" style={{ height: "100vh" }}>
+      <div className="flex-1 min-h-0 px-8 pt-5 pb-3 flex flex-col">
+        <div className="flex items-baseline justify-between shrink-0 mb-2">
+          <h2 className="text-lg font-semibold text-[#e7c977]">
+            {page === "final" ? "Loppusuora — välierä & finaali" : TRIPLA_SEC_TITLE[page]}
+          </h2>
+          <span className="text-[10px] text-[#e7c977]">V = mihin otteluun voittaja siirtyy · H = mihin otteluun häviäjä siirtyy</span>
+        </div>
+        <div className="flex-1 min-h-0 overflow-hidden flex items-center justify-center gap-10">
+          {page === "final" ? (
+            <>
+              {renderTriplaHorizontalSection({ sec: "SF", bracketDef, bracketMatchesById, bracketResults, bracketTargets, large: true })}
+              {renderTriplaHorizontalSection({ sec: "F", bracketDef, bracketMatchesById, bracketResults, bracketTargets, large: true })}
+            </>
+          ) : (
+            renderTriplaHorizontalSection({ sec: page, bracketDef, bracketMatchesById, bracketResults, bracketTargets })
+          )}
+        </div>
+      </div>
+
+      {pages.length > 1 && (
+        <div className="flex justify-center gap-2 pb-4 shrink-0">
+          {pages.map((p, i) => (
+            <span key={p} className={`w-2 h-2 rounded-full ${i === pageIndex ? "bg-[#e7c977]" : "bg-[#3a5c46]"}`} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// REM: Sovelluksen käynnistys - ohjelman tekijä: Johannes Ketola
+// ?view=boards tai ?view=bracket avaa erillisen, ei-interaktiivisen
+// näyttönäkymän isolle näytölle - se ei ole eri sivu, vaan samasta
+// tiedostosta avattu toinen välilehti, joka lukee samaa istuntoa reaaliajassa.
+const __urlParams = new URLSearchParams(window.location.search);
+const __view = __urlParams.get("view");
+const __appRoot = ReactDOM.createRoot(document.getElementById("root"));
+if (TCLink.validCode(__urlParams.get("jatka"))) {
+  __appRoot.render(<JatkaView code={__urlParams.get("jatka")} />);
+} else if (__view === "boards" || __view === "bracket") {
+  __appRoot.render(<DisplayView view={__view} />);
+} else {
+  __appRoot.render(<DartsParittaja />);
+}
+// REM: Ohjelman loppu - tekijä: Johannes Ketola
+</script>
+</body>
+</html>
+<!-- REM: Triplacup - ohjelman tekijä: Johannes Ketola -->
