@@ -321,7 +321,7 @@
 <div id="fmToast"></div>
 <div class="jdc-overlay hidden" id="x01KbSheet"></div>
 <!-- ACRHI:n yhteisten funktioiden käyttämät, taulusivulla piilotetut elementit -->
-<div id="tcHiddenEls" class="hidden" style="display:none"><div id="count-p1" class="hidden"></div><div id="count-p2" class="hidden"></div><div id="dartPips" class="hidden"></div><div id="mainGrid" class="hidden"></div><div id="namebar-p1" class="hidden"></div><div id="namebar-p2" class="hidden"></div><div id="panel-p1" class="hidden"></div><div id="panel-p2" class="hidden"></div><div id="roundInfo" class="hidden"></div><div id="score501Panel" class="hidden"></div><div id="switchTurnBtn" class="hidden"></div><div id="throwInfo501" class="hidden"></div><div id="undoBtn" class="hidden"></div><div id="x01MatchEndBcBtn" class="hidden"></div><div id="x01MatchEndKoBtn" class="hidden"></div><div id="x01NamesScreen" class="hidden"></div><div id="x01SetupScreen" class="hidden"></div><div id="x01SummaryScreen" class="hidden"></div></div>
+<div id="tcHiddenEls" class="hidden" style="display:none"><div id="count-p1" class="hidden"></div><div id="count-p2" class="hidden"></div><div id="dartPips" class="hidden"></div><div id="mainGrid" class="hidden"></div><div id="namebar-p1" class="hidden"></div><div id="namebar-p2" class="hidden"></div><div id="panel-p1" class="hidden"></div><div id="panel-p2" class="hidden"></div><div id="roundInfo" class="hidden"></div><div id="score501Panel" class="hidden"></div><div id="switchTurnBtn" class="hidden"></div><div id="throwInfo501" class="hidden"></div><div id="undoBtn" class="hidden"></div><div id="x01MatchEndBcBtn" class="hidden"></div><div id="x01MatchEndKoBtn" class="hidden"></div><div id="x01NamesScreen" class="hidden"></div><div id="x01SetupScreen" class="hidden"></div><div id="x01SummaryScreen" class="hidden"></div><button class="pip" data-n="1"></button><button class="pip" data-n="2"></button><button class="pip" data-n="3"></button></div>
 <script>
 (function(){
 'use strict';
@@ -3844,6 +3844,8 @@ var TCLink = (function () {
         }, onConn);
       },
       assign: function (a) { return req("PUT", "/k/assign", { cfg: a.cfg, v: a.v, boards: bk(a.boards) }); },
+      // uusi turnaus: taulut tyhjiksi ja vanhat live-tilanteet ja tulokset pois
+      reset: function (a) { return req("PUT", "/k", { assign: { cfg: a.cfg, v: a.v } }); },
       live: function (b, L) { return req("PUT", "/k/live/b" + b, L); },
       result: function (b, R) { return req("PUT", "/k/result/b" + b, R); },
       ack: function (b) { var o = {}; o["live/b" + b] = null; o["result/b" + b] = null; return req("PATCH", "/k", o); },
@@ -3872,6 +3874,7 @@ var TCLink = (function () {
         return function () { alive = false; clearTimeout(t); };
       },
       assign: function (a) { return jreq("/api/assign", "POST", a, H); },
+      reset: function (a) { return jreq("/api/assign", "POST", a, H); },
       live: function (b, L) { return jreq("/api/live/" + b, "POST", L, H); },
       result: function (b, R) { return jreq("/api/result/" + b, "POST", R, H); },
       ack: function (b) { return jreq("/api/ack/" + b, "POST", {}, H); },

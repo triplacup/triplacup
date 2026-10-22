@@ -152,6 +152,8 @@ var TCLink = (function () {
         }, onConn);
       },
       assign: function (a) { return req("PUT", "/k/assign", { cfg: a.cfg, v: a.v, boards: bk(a.boards) }); },
+      // uusi turnaus: taulut tyhjiksi ja vanhat live-tilanteet ja tulokset pois
+      reset: function (a) { return req("PUT", "/k", { assign: { cfg: a.cfg, v: a.v } }); },
       live: function (b, L) { return req("PUT", "/k/live/b" + b, L); },
       result: function (b, R) { return req("PUT", "/k/result/b" + b, R); },
       ack: function (b) { var o = {}; o["live/b" + b] = null; o["result/b" + b] = null; return req("PATCH", "/k", o); },
@@ -180,6 +182,7 @@ var TCLink = (function () {
         return function () { alive = false; clearTimeout(t); };
       },
       assign: function (a) { return jreq("/api/assign", "POST", a, H); },
+      reset: function (a) { return jreq("/api/assign", "POST", a, H); },
       live: function (b, L) { return jreq("/api/live/" + b, "POST", L, H); },
       result: function (b, R) { return jreq("/api/result/" + b, "POST", R, H); },
       ack: function (b) { return jreq("/api/ack/" + b, "POST", {}, H); },
@@ -1631,6 +1634,12 @@ function DartsParittaja() {
     const cfg = { start: kirjaus.start, tb: kirjaus.tb ? kirjaus.tbDarts : 0 };
     return { cfg, boards, v: TCLink.hash(JSON.stringify({ cfg, boards })) };
   }, [triplaBoards, kirjaus, bracketMatchesById, bracketTotalRounds]);
+  // turnaus ei ole käynnissä (uusi turnaus aloitettu): tauluilta pois edellisen turnauksen ottelut
+  useEffect(() => {
+    if (!link || phase === "tournament") return;
+    const cfg = { start: kirjaus.start, tb: kirjaus.tb ? kirjaus.tbDarts : 0 };
+    link.reset({ cfg, boards: {}, v: TCLink.hash(JSON.stringify({ cfg, boards: {} })) }).catch(() => {});
+  }, [link, phase]);
   // ottelut tauluille aina, kun ne muuttuvat
   useEffect(() => {
     if (!link || phase !== "tournament") return;
